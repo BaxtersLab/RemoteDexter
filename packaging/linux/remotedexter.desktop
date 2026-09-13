@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=RemoteDexter
+GenericName=Remote Desktop Host
+Comment=Share this desktop with a paired Android device
+Exec=remotedexter
+Icon=remotedexter
+Terminal=false
+Categories=Network;RemoteAccess;
+Keywords=remote;desktop;android;phone;wayland;
+StartupNotify=true

@@ -1,0 +1,34 @@
+[package]
+name = "remotedexter"
+version = "0.1.0"
+edition = "2021"
+# The two artifacts that ship. AGPL-3.0-only, inherited from the workspace.
+license.workspace = true
+
+[lib]
+name = "remotedexter"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+module14_apk_session = { path = "../modules/module14_apk_session" }
+# The stream wire format only — zero dependencies, so the Android .so does not
+# inherit module11's capture/encode stack (85 crates, incl. a second crypto lib).
+stream_chunk = { path = "../modules/stream_chunk" }
+wire = { path = "../crates/wire" }
+# The relay's control grammar ONLY -- serde and serde_json, both of which this
+# crate already carries, so the Android .so gains no new external crate. NOT
+# `relay`: that is the relay SERVER, and the client has no business linking a
+# session table and host authentication it will never run.
+relay_proto = { path = "../crates/relay_proto" }
+lazy_static = "1.4"
+jni = { version = "0.21", default-features = false }
+tokio = { version = "1", features = ["net", "rt-multi-thread", "io-util"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+snow = "0.9"
+sha2 = "0.10"
+
+[features]
+default = []
+test-support = []

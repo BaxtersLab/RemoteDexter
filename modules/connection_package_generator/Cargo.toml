@@ -1,0 +1,17 @@
+[package]
+name = "connection_package_generator"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+
+[lib]
+name = "connection_package_generator"
+path = "src/lib.rs"
+
+[dependencies]
+rand = "0.8"
+sil = { path = "../../sil" }
+tokio = { version = "1", features = ["time", "sync"] }
+
+[dev-dependencies]
+rand = "0.8"

@@ -1,0 +1,143 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Settings.
+
+  Created to give the main screen its bottom row back: the cursor-lift slider
+  was taking a quarter of the width of the row that also holds Enable Control,
+  Connect and Disconnect — space those need, and space a preference set once and
+  rarely touched does not deserve.
+
+  It is also where the paired-host list belongs. A list of hosts cannot live in
+  a toolbar, and the main screen has no room for one; here it has a whole page.
+-->
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:orientation="vertical"
+        android:padding="16dp"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content">
+
+        <!-- ── paired hosts ──────────────────────────────────────────── -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/settings_paired_hosts"
+            android:textStyle="bold"
+            android:textSize="16sp"/>
+
+        <!--
+          Filled at runtime, one child per paired host, rather than a
+          RecyclerView. This list is a handful of machines a person owns; a
+          recycler exists to avoid inflating rows that scroll past, and there
+          are none. The dependency and the adapter would both be ceremony.
+        -->
+        <LinearLayout
+            android:id="@+id/pairedHostList"
+            android:orientation="vertical"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingTop="4dp"/>
+
+        <!--
+          ONE sentence for the state of this screen, between the list and the
+          button it refers to.
+
+          There were two, and on the device they read as a stutter: an empty
+          list said "No host paired. Scan a QR from the main screen." and the
+          line under the button said "No hosts paired yet. Scan a QR from the
+          main screen — the first host is trusted on sight." Same instruction,
+          twice, three lines apart. The list placeholder went; this line covers
+          the empty case as one of its three states, and when there ARE hosts it
+          sits where an instruction about the button should sit.
+        -->
+        <TextView
+            android:id="@+id/txtEnrollmentState"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingTop="8dp"
+            android:paddingBottom="2dp"
+            android:textSize="13sp"/>
+
+        <!--
+          Adding a host is a deliberate act on THIS screen, which is the whole
+          shape of the decision: the scan path still refuses an identity it does
+          not know, and pressing this is the only thing that changes that — for
+          one host, for a few minutes. A QR alone can never add a machine.
+        -->
+        <Button
+            android:id="@+id/btnAddHost"
+            android:text="@string/settings_add_host"
+            android:minHeight="48dp"
+            android:layout_marginTop="4dp"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"/>
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="18dp"
+            android:layout_marginBottom="18dp"
+            android:background="?android:attr/listDivider"/>
+
+        <!-- ── cursor lift ───────────────────────────────────────────── -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/cursor_lift_label"
+            android:textStyle="bold"
+            android:textSize="16sp"/>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingTop="4dp"
+            android:textSize="13sp"
+            android:text="@string/settings_cursor_lift_help"/>
+
+        <TextView
+            android:id="@+id/txtCursorLiftValue"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingTop="8dp"
+            android:textSize="14sp"/>
+
+        <SeekBar
+            android:id="@+id/seekCursorLift"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:minHeight="48dp"
+            android:max="120"
+            android:progress="0"
+            android:contentDescription="@string/cursor_lift_label"/>
+        <!-- AGPL-3.0 section 13 notice. Must stay reachable from the client:
+             the phone user is the remote user the clause is about. -->
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="20dp"
+            android:background="?android:attr/listDivider"/>
+
+        <TextView
+            android:id="@+id/txtLicenceNotice"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingTop="12dp"
+            android:text="@string/licence_notice"
+            android:textSize="14sp"/>
+
+        <TextView
+            android:id="@+id/txtLicenceSource"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingTop="4dp"
+            android:paddingBottom="8dp"
+            android:autoLink="web"
+            android:text="@string/licence_source_url"
+            android:contentDescription="@string/licence_source_label"
+            android:textSize="14sp"/>
+    </LinearLayout>
+</ScrollView>

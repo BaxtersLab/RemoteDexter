@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Pair: a QR code, reduced to the three finder squares plus data cells. The finder squares are what make a QR recognisable at a glance. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:pathData="M4,4 h6 v6 h-6 z"
+        android:fillColor="#00000000"
+        android:strokeColor="#FF000000"
+        android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M14,4 h6 v6 h-6 z"
+        android:fillColor="#00000000"
+        android:strokeColor="#FF000000"
+        android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M4,14 h6 v6 h-6 z"
+        android:fillColor="#00000000"
+        android:strokeColor="#FF000000"
+        android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path android:pathData="M14,14 h2.5 v2.5 h-2.5 z" android:fillColor="#FF000000" />
+    <path android:pathData="M17.5,17.5 h2.5 v2.5 h-2.5 z" android:fillColor="#FF000000" />
+    <path android:pathData="M14,19 h2 v1 h-2 z" android:fillColor="#FF000000" />
+    <path android:pathData="M19,14 h1 v2 h-1 z" android:fillColor="#FF000000" />
+</vector>

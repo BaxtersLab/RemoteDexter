@@ -1,0 +1,260 @@
+// app/build.gradle — RemoteDexter Android module
+// Reconstructed from recovered sources — March 2026
+//
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// EVERY dependency below carries its licence inline, and every one of them has
+// a row in ../../docs/DEPENDENCIES.md §4. scripts/gate.sh fails if a direct
+// dependency is added here without that row — a library that arrives with no
+// stated licence and no stated reason is how a licence audit becomes
+// archaeology. Add the row in the same change, not afterwards.
+
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+/**
+ * What this artifact was built from, for the version string.
+ *
+ * `<short sha>` normally, `<short sha>-dirty` when the tree has uncommitted
+ * changes, and `nogit-<yyyyMMdd>` when there is no repository at all — which is
+ * the ordinary case for the Windows box, since the transfer drive deliberately
+ * ships without `.git/` so nothing can be pushed from it.
+ *
+ * Uses ProcessBuilder rather than `project.exec`, which is deprecated in newer
+ * Gradle, or `providers.exec`, which does not exist in older ones. This has to
+ * work on whatever the Windows box has.
+ *
+ * Fails soft, always: a build must never break because git is absent or slow.
+ */
+static String buildStamp() {
+    try {
+        def sha = "git rev-parse --short=7 HEAD".execute().with {
+            waitFor() == 0 ? text.trim() : null
+        }
+        if (sha == null || sha.isEmpty()) {
+            return "nogit-" + new Date().format("yyyyMMdd")
+        }
+        def dirty = "git status --porcelain".execute().with {
+            waitFor() == 0 ? !text.trim().isEmpty() : false
+        }
+        return dirty ? sha + "-dirty" : sha
+    } catch (Exception ignored) {
+        return "nogit-" + new Date().format("yyyyMMdd")
+    }
+}
+
+android {
+    namespace 'com.remotedexter'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.remotedexter"
+        minSdk 26
+        targetSdk 34
+        // Three separately published builds already call themselves
+        // "3.0.0 / versionCode 1" — an older March build with the pre-rename
+        // invite schema, an August rebrand, and a VirtualOffice-applicationId
+        // build. They are only distinguishable by SHA-256, and installing the
+        // wrong one is what produced the "Invalid QR" pairing failure.
+        // Do not reuse 3.0.0. Bump this for every artifact that leaves the box.
+        //
+        // 3.0.3 adds the Unpair control to Diagnostics. SessionStarter told the
+        // user to "forget the paired host in Session Permissions", but nothing
+        // called HostIdentityTrust.forget() from any UI — so that remedy did not
+        // exist and a legitimate host re-key could only be cleared over adb.
+        // Two full test rounds were lost to it.
+        //
+        // 3.0.4 adds touch control that actually works: sub-pixel accumulation
+        // (a drag below 0.667px used to move the cursor not at all, and every
+        // drag under-travelled ~11%), send coalescing (one encrypted round trip
+        // per touch sample became one per ~16ms), and long-press click-and-drag
+        // so text selection and window moving are possible at all. Gated at 27
+        // Kotlin tests + 3 Rust wire-contract tests.
+        // 3.0.5 compacts the control panel. Two rows of stock Material buttons
+        // (48dp min-height + 6dp insets each, before text) were taking roughly a
+        // third of the screen away from the desktop view — the one thing the app
+        // exists to show. One row now, explicit 0dp min/inset overrides, plus a
+        // live link indicator driven by SessionOrchestrator's own phase.
+        // 3.0.8 keeps the visible viewer awake while Streaming, makes Back
+        // background the task without ending its foreground session, and gives
+        // Enable Control plus Disconnect reliable 48dp touch targets.
+        // 3.0.9 keeps forwarding one-finger motion after Android recognizes a
+        // long press, so the latched mouse button can perform a real drag.
+        // 3.0.10 returns to viewing-only when the host denies input, so the
+        // control label cannot claim a grant the host has already revoked.
+        // 3.0.11 also blocks duplicate grant/revoke requests while a control
+        // round trip is pending, preventing a late revoke from racing a grant.
+        // 3.0.12 clears and disables control when a session ends, so an EOF
+        // cannot leave a stale control claim or accept requests while idle.
+        // 3.0.13 is the landscape control column, the scroll buttons, the
+        // two-finger right click, and the four input-release paths.
+        //
+        // THE BUMP ABOVE IS NO LONGER THE ONLY THING KEEPING BUILDS APART, and
+        // it should not have been. Five days of work — the layout rework, the
+        // scroll buttons, the right click, the release paths — all shipped as
+        // "3.0.12 / versionCode 13", because a rule that says "remember to bump
+        // this" is a rule that gets forgotten. The Windows box found it on
+        // 2026-08-31: the APK on the drive and the APK already on the phone
+        // reported identical versions and were distinguishable only by
+        // lastUpdateTime. That is the same hazard as the three builds that all
+        // called themselves 3.0.0.
+        //
+        // `buildStamp()` appends the commit the artifact was built from, so
+        // every build identifies itself whether or not anyone remembered.
+        versionCode 14
+        versionName "3.0.13+" + buildStamp()
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    // The artifact names itself. A file called "app-debug.apk" on a transfer
+    // drive says nothing about what is inside it, which is how a stale build
+    // gets installed — and a date in the filename is not a version, because two
+    // builds on the same day share it.
+    applicationVariants.all { variant ->
+        variant.outputs.all { output ->
+            outputFileName = "RemoteDexter-${variant.versionName}-${variant.buildType.name}.apk"
+        }
+    }
+
+    /*
+      Release signing, WITHOUT a key in this repository.
+
+      A release APK with no signing config builds happily and cannot be
+      installed: `apksigner verify` says "DOES NOT VERIFY -- Missing
+      META-INF/MANIFEST.MF". That was the state until 2026-09-01, when the first
+      release build in this project's history was attempted and produced exactly
+      that. A build whose output cannot be installed is not a build.
+
+      The key stays with the operator. Signing private keys are out of scope and
+      offline by design: a keystore committed once is committed forever, and no
+      amount of later care takes it back out of a history. So the credentials
+      come from the ENVIRONMENT and nothing key-shaped is ever read from the
+      tree:
+
+          RDX_KEYSTORE           path to the .jks, outside this repo
+          RDX_KEYSTORE_PASSWORD
+          RDX_KEY_ALIAS
+          RDX_KEY_PASSWORD
+
+      With all four set and the file present, release builds are signed. With any
+      of them missing the build still succeeds -- CI and gate runs must not need
+      a key -- but it says so, and `check_release_signing.sh` is what stops an
+      unsigned APK being mistaken for a releasable one.
+    */
+    def rdxKeystore = System.getenv("RDX_KEYSTORE")
+    def rdxStorePass = System.getenv("RDX_KEYSTORE_PASSWORD")
+    def rdxKeyAlias = System.getenv("RDX_KEY_ALIAS")
+    def rdxKeyPass = System.getenv("RDX_KEY_PASSWORD")
+    def rdxCanSign = rdxKeystore != null && rdxStorePass != null &&
+                     rdxKeyAlias != null && rdxKeyPass != null &&
+                     file(rdxKeystore).exists()
+
+    signingConfigs {
+        if (rdxCanSign) {
+            release {
+                storeFile file(rdxKeystore)
+                storePassword rdxStorePass
+                keyAlias rdxKeyAlias
+                keyPassword rdxKeyPass
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            if (rdxCanSign) {
+                signingConfig signingConfigs.release
+                println "build.gradle: release will be SIGNED with the operator's keystore"
+            } else {
+                println "build.gradle: RELEASE WILL BE UNSIGNED — set RDX_KEYSTORE, " +
+                        "RDX_KEYSTORE_PASSWORD, RDX_KEY_ALIAS and RDX_KEY_PASSWORD to sign. " +
+                        "An unsigned release APK cannot be installed."
+            }
+        }
+        debug {
+            debuggable true
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+
+    // Native library from Rust cross-compilation
+    sourceSets {
+        main {
+            jniLibs.srcDirs = ['src/main/jniLibs']
+        }
+    }
+}
+
+dependencies {
+    implementation 'androidx.core:core-ktx:1.12.0'                 // Apache-2.0
+    implementation 'androidx.appcompat:appcompat:1.6.1'              // Apache-2.0
+    implementation 'com.google.android.material:material:1.11.0'     // Apache-2.0
+    implementation 'androidx.constraintlayout:constraintlayout:2.1.4' // Apache-2.0
+    implementation 'androidx.lifecycle:lifecycle-service:2.7.0'      // Apache-2.0
+    implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.7.0'  // Apache-2.0
+
+    // QR pairing (bootstrap18): ScanContract / ScanOptions / ScanIntentResult
+    // and the CaptureActivity the scanner launches.
+    implementation 'com.journeyapps:zxing-android-embedded:4.3.0'    // Apache-2.0
+
+    // Ed25519 invite-signature verification. Android's own
+    // java.security.Signature only gained "Ed25519" at API 33 and minSdk here is
+    // 26, so verification uses Bouncy Castle's lightweight crypto API
+    // (org.bouncycastle.crypto.signers.Ed25519Signer) — the same class the
+    // shipped 3.0.0 build used. Does not collide with the platform's
+    // repackaged com.android.org.bouncycastle.
+    implementation 'org.bouncycastle:bcprov-jdk18on:1.77'            // Bouncy Castle Licence (MIT-style)
+
+    // JVM unit tests. PointerMotion is deliberately free of android.* and JNI,
+    // so the pointer arithmetic and the drag latch are testable with plain
+    // JUnit — no emulator, no Robolectric, no test doubles for product code.
+    testImplementation 'junit:junit:4.13.2'                              // EPL-1.0 — TEST SCOPE ONLY, never packaged
+    // A real JVM JSON implementation for the wire-contract test. Android's own
+    // org.json is stubbed to throw in unit tests, so the platform class cannot
+    // be used here; this is the reference implementation it was derived from.
+    testImplementation 'org.json:json:20240303'                          // Public Domain — test scope
+
+    // On-device tests. SurfaceTouchRouter's behaviour is Android's — whether
+    // GestureDetector fires onLongPress, and whether ACTION_CANCEL is delivered
+    // at all — so it can only be proven against a real runtime, not the JVM.
+    androidTestImplementation 'androidx.test.ext:junit:1.1.5'                   // Apache-2.0 — test scope
+    androidTestImplementation 'androidx.test:core:1.5.0'                        // Apache-2.0 — test scope
+    androidTestImplementation 'androidx.test:runner:1.5.2'                      // Apache-2.0 — test scope
+}
+
+// ── Files these unit tests read from the SOURCE TREE, not the classpath ──────
+//
+// DataExtractionRulesTest reads AndroidManifest.xml and res/xml, and the two
+// contract tests read ../../contract/*.json. Gradle cannot see a file a test
+// opens at runtime, so with nothing declared here the test task is UP-TO-DATE
+// after one of those files changes and the guard SILENTLY DOES NOT RUN — the
+// previous result is reported again, green.
+//
+// That is not hypothetical: red-proving DataExtractionRulesTest, the manifest
+// attribute was deleted and the suite reported 2 passed. It only went red once
+// `--rerun-tasks` forced execution. A guard over a file that no longer runs
+// when that file changes is worse than no guard, because it reads as evidence.
+tasks.withType(Test).configureEach {
+    inputs.file('src/main/AndroidManifest.xml')
+        .withPropertyName('manifestUnderTest')
+        .withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.dir('src/main/res/xml')
+        .withPropertyName('resXmlUnderTest')
+        .withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.dir('../../contract')
+        .withPropertyName('wireContracts')
+        .withPathSensitivity(PathSensitivity.RELATIVE)
+}

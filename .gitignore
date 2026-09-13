@@ -1,0 +1,83 @@
+# RemoteDexter — .gitignore
+#
+# Rules only. This file ships in the public source export, so it carries no
+# infrastructure detail, no key history and no internal audit narrative: an
+# ignore file should say what is ignored, never where anything lives.
+
+# ── build artifacts ──────────────────────────────────────────────────────
+/target
+**/target
+.cargo-target/
+*.pdb
+__pycache__/
+*.dmp
+*.exe
+
+# Gradle
+.gradle/
+build/
+apk/app/build/
+local.properties
+
+# Published APKs are 14 MB each and reproducible; their digests are tracked in
+# apk/dist/SHA256SUMS, which is the part that matters.
+apk/dist/*.apk
+
+# gate output
+target/gate-logs/
+
+# ── credentials: never tracked ───────────────────────────────────────────
+# Nothing key-shaped belongs in this repository. Signing reads credentials the
+# operator holds from the environment and writes nothing to disk, so none of
+# these files should ever exist here — which is the reason to ignore them, not
+# a reason to leave them out.
+#
+# Host identity files are named explicitly as well as covered by the patterns
+# below, so relocating them cannot quietly start tracking them.
+host_static_identity.key
+host_signing_identity.key
+rdx_update.jks
+rdx_update_cert.pem
+
+# Key and certificate material of any shape. Use `git add -f` if a genuinely
+# public artifact ever needs one of these extensions — the friction is the point.
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.ppk
+*.key
+*.der
+*.crt
+*.cer
+*.asc
+*.gpg
+*.kdbx
+id_rsa
+id_ecdsa
+id_ed25519
+.env
+.env.*
+
+# Android signing configuration. `keystore.properties` is the file Android's own
+# documentation tells developers to put storePassword and keyPassword into, so a
+# builder following the standard recipe must not be able to commit it by default.
+keystore.properties
+signing.properties
+secrets.json
+credentials.json
+
+# ── local noise ──────────────────────────────────────────────────────────
+debug_logs/
+test_runs/
+*.bak
+.idea/
+*.iml
+
+# ── Windows packaging output ─────────────────────────────────────────────
+# build_windows.ps1 stages host_app.exe next to run.bat, because that is where
+# the launcher looks. A build artifact in a source directory, so it is named
+# here explicitly — `target/` does not cover it.
+/windows/host_app.exe
+/dist/

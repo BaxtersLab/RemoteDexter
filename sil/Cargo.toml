@@ -1,0 +1,13 @@
+[package]
+name = "sil"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+
+[lib]
+name = "sil"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
+governor = { path = "../governor" }

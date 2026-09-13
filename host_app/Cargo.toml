@@ -1,0 +1,85 @@
+[package]
+name = "host_app"
+version = "0.1.0"
+edition = "2021"
+# The two artifacts that ship. AGPL-3.0-only, inherited from the workspace.
+license.workspace = true
+
+[[bin]]
+name = "host_app"
+path = "src/main.rs"
+
+[dependencies]
+session_manager          = { path = "../modules/session_manager" }
+module13_transport       = { path = "../modules/module13_transport" }
+module11 = { path = "../modules/module11" }
+module10 = { path = "../modules/module10" }
+# RemoteDexter's own authorization authority. Absorbed in Block 2 from the
+# operator-owned VoDesktop/core, which used to sit behind a `../../../VoDesktop`
+# path dependency — a cross-workspace reach that made this tree impossible to
+# clone, build or publish on its own. session_core is zero-dependency by design:
+# the rules that decide whether a frame may leave the machine are auditable
+# without a network, a display server, or any third-party code in the path.
+session_core = { path = "../crates/session_core" }
+host_controller = { path = "../crates/host_controller" }
+# The relay's control grammar ONLY -- not the relay server. See
+# crates/relay_proto: the host speaks this grammar to dial out, and depending on
+# `relay` itself would put the server inside the client of that server.
+relay_proto = { path = "../crates/relay_proto" }
+pairing = { path = "../crates/pairing" }
+wire = { path = "../crates/wire" }
+ed25519-dalek = "2"
+
+# ── Host console UI ─────────────────────────────────────────────────────────
+# eframe/egui: one Rust UI for Linux and Windows, immediate-mode so the console
+# cannot drift out of sync with the controller's state the way a retained-widget
+# tree can. Version PINNED exactly: a GUI stack is the last place to accept a
+# silent minor bump.
+#
+# `default-features = false` is load-bearing, not tidiness. eframe's defaults are
+#   [accesskit, default_fonts, links, wayland, web_screen_reader, wgpu,
+#    winit/default, x11]
+# and this box is Wayland-only. Article XIV.4: never create, install, enable,
+# configure or test an Xorg session here — a previous attempt cost a full OS
+# reinstall. Enabling `x11` would not start an Xorg session by itself, but it
+# links libX11 into the host binary and lets winit select an X11 backend
+# whenever DISPLAY is set, which is exactly the "direct launch that changes the
+# selected display backend" Article XIV.6 forbids. Wayland must be the only
+# option the binary HAS.
+#
+# scripts/check_no_x11.sh proves it against the resolved feature graph AND the
+# linked binary, because a feature list is a claim and `ldd` is evidence.
+eframe = { version = "=0.36.1", default-features = false, features = [
+    "wayland",
+    "wgpu",
+    "default_fonts",
+] }
+
+# Non-loopback interface enumeration for the "which network?" picker. Chosen for
+# being small and doing one thing. MIT OR BSD-3-Clause.
+if-addrs = "0.15"
+# Full-desktop Windows capture (Block 8). Replaces
+# `capture_windows_printwindow`, which shared one window at a time because it
+# came from VoDesktop, where that was the point.
+capture_windows = { path = "../crates/capture_windows" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "net", "io-util"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+snow = "0.9"
+sha2 = "0.10"
+base64 = "0.22"
+
+[dev-dependencies]
+# The relay SERVER, for tests only: the dial-out is proven against a real relay
+# on loopback rather than a hand-written fake that would agree with whatever
+# this file happens to send.
+relay = { path = "../crates/relay" }
+rand = "0.8"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+remotedexter = { path = "../rust", features = ["test-support"] }
+
+[features]
+default = []
+rdup1 = []  # RDUP1 integration: agentic orchestrator + model loader
+rdup2 = []  # RDUP2 integration: state context manager + cognitive engine

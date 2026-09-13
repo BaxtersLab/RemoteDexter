@@ -1,0 +1,19 @@
+[package]
+name = "session_core"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "RemoteDexter's authorization authority: surface scope, consent, and the session state machine that is the only thing permitted to authorize a frame or an input event."
+
+# Intentionally NO dependencies. This crate is the security boundary; keeping it
+# dependency-free means its guarantees are auditable and unit-testable without a
+# network, a display server, or any third-party code in the trusted path.
+#
+# Absorbed from the operator-owned `VoDesktop/core` (declared MIT) in Block 2 of
+# the RemoteDexter rebuild. See docs/THIRD_PARTY_NOTICES.md. Original code,
+# owned by the operator.
+[dependencies]
+
+[lib]
+name = "session_core"
+path = "src/lib.rs"

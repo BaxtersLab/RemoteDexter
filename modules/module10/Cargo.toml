@@ -1,0 +1,46 @@
+[package]
+name = "module10"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+
+[dependencies]
+futures = "0.3"
+sil = { path = "../../sil" }
+tokio = { version = "1", features = ["time", "sync"] }
+serde = { version = "1.0", features = ["derive"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# Linux input injection. `evdev` is pure Rust over libc ioctls — no C library
+# to link, nothing to install beyond membership of the `input` group.
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = { version = "0.13", optional = true }
+
+[dev-dependencies]
+# The Android wire contract is expressed as JSON, so the test that checks the
+# host's own derives against it needs a JSON reader. Test-only: the shipped
+# module carries no serde_json dependency.
+serde_json = "1.0"
+
+# The live test reads its own injected events back out of the evdev nodes, so
+# it needs evdev unconditionally rather than through the optional dependency.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+evdev = "0.13"
+# The visual proof photographs the desktop after an injected move, to show the
+# compositor acted on the event and not merely the kernel.
+module11 = { path = "../module11" }
+
+[features]
+default = ["linux-input"]
+
+# Real input injection on Linux, via the kernel's uinput virtual device. On by
+# default: a host that reports events it "would have injected" is not a remote
+# desktop. Build with --no-default-features to fall back to that reporting
+# no-op. No effect on other targets — the dependency is target-gated.
+linux-input = ["dep:evdev"]

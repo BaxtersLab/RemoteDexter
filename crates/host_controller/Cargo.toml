@@ -1,0 +1,13 @@
+[package]
+name = "host_controller"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "The host lifecycle state machine: the only thing permitted to create a listener, start capture, or open input devices. Owns no UI and no keys."
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "net", "sync", "time", "macros"] }
+
+[lib]
+name = "host_controller"
+path = "src/lib.rs"

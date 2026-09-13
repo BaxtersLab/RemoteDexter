@@ -1,0 +1,20 @@
+[package]
+name = "module15_host_session"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+bytes = "1"
+thiserror = "2"
+image = "0.24"
+rodio = { version = "0.17", features = ["symphonia-mp3", "symphonia-wav"] }
+
+module13_transport = { path = "../module13_transport" }
+module14_apk_session = { path = "../module14_apk_session" }
+module11 = { path = "../module11" }
+
+[lib]
+name = "module15_host_session"
+path = "src/lib.rs"

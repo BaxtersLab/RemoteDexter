@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Touch mode: an aiming ring with a solid contact point, and an arrow coming
+  into it — "the cursor goes where you point".
+
+  The arrowhead is at the RING end. It was at the far end first, which drew an
+  arrow leaving the target rather than aiming at it — and with a circle on one
+  end and a barb on the other it read as the Mars symbol.
+
+  The attempt before that was the contact dot with two arcs rising above it, and
+  on the device it read as a WI-FI SYMBOL. That is not a subtle resemblance: dot
+  plus stacked arcs IS the wifi glyph, and it sat two icons away from a QR code
+  in a networking app. The full ring and the incoming arrow are what make it
+  unmistakably a pointer rather than a signal.
+
+  Drawn for RemoteDexter. No Material path data is copied.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:pathData="M14,14 m-6,0 a6,6 0 1,0 12,0 a6,6 0 1,0 -12,0"
+        android:fillColor="#00000000"
+        android:strokeColor="#FF000000"
+        android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path android:pathData="M14,14 m-2.4,0 a2.4,2.4 0 1,0 4.8,0 a2.4,2.4 0 1,0 -4.8,0"
+        android:fillColor="#FF000000" />
+    <path
+        android:pathData="M2.5,2.5 L9.6,9.6"
+        android:fillColor="#00000000"
+        android:strokeColor="#FF000000"
+        android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:pathData="M6.4,9.6 H9.6 V6.4"
+        android:fillColor="#00000000"
+        android:strokeColor="#FF000000"
+        android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+</vector>

@@ -1,0 +1,36 @@
+[package]
+name = "capture_windows"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "Full-desktop Windows capture: DXGI Desktop Duplication with a tested GDI fallback."
+
+[dependencies]
+session_core = { path = "../session_core" }
+# Already a documented direct dependency of this workspace (docs/DEPENDENCIES.md
+# section 2). Used by windows-frame-probe to fingerprint a captured frame so two
+# runs can be compared without shipping the pixels anywhere.
+sha2 = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+# Pinned exactly, like every other FFI surface in this tree. A minor bump in a
+# crate that hands out raw COM pointers is not a minor bump.
+windows = { version = "=0.58.0", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[lib]
+name = "capture_windows"
+path = "src/lib.rs"
+
+[[bin]]
+# The evidence instrument. Answers "is the raw capture white?" before anyone
+# argues about encoders. Windows-only at run time; builds everywhere.
+name = "windows-frame-probe"
+path = "src/bin/windows_frame_probe.rs"

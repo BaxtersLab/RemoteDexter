@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  One paired host in the Settings list.
+
+  The row is the selector: tapping it points Connect at this host. Forget is a
+  separate button on the right rather than a swipe or a long press, because a
+  gesture that destroys a pairing should be one you can see before you make it.
+
+  48dp minimum, and the whole row is clickable rather than just the label — a
+  target the width of a text run is a target that misses.
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:orientation="horizontal"
+    android:gravity="center_vertical"
+    android:minHeight="56dp"
+    android:paddingTop="4dp"
+    android:paddingBottom="4dp"
+    android:background="?android:attr/selectableItemBackground"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content">
+
+    <LinearLayout
+        android:orientation="vertical"
+        android:layout_width="0dp"
+        android:layout_weight="1"
+        android:layout_height="wrap_content">
+
+        <TextView
+            android:id="@+id/txtHostLabel"
+            android:textSize="15sp"
+            android:maxLines="1"
+            android:ellipsize="end"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"/>
+
+        <!--
+          The fingerprint, at the size of a caption. It is the only thing on
+          screen that distinguishes two hosts sharing an address after a DHCP
+          lease moved, so it is present on every row rather than hidden behind
+          a details tap — but it is not what the operator reads first.
+        -->
+        <TextView
+            android:id="@+id/txtHostFingerprint"
+            android:textSize="12sp"
+            android:maxLines="1"
+            android:ellipsize="end"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"/>
+    </LinearLayout>
+
+    <Button
+        android:id="@+id/btnForgetThisHost"
+        android:text="@string/settings_forget_short"
+        android:textSize="12sp"
+        android:minWidth="0dp"
+        android:minHeight="48dp"
+        android:paddingStart="12dp"
+        android:paddingEnd="12dp"
+        android:layout_width="wrap_content"
+        android:layout_height="48dp"
+        android:layout_marginStart="8dp"/>
+</LinearLayout>

@@ -1,0 +1,383 @@
+#!/bin/sh
+# remotedexter-enable-input — the only privileged operation RemoteDexter has.
+#
+# Installed root-owned at /usr/libexec/remotedexter/remotedexter-enable-input,
+# mode 0755. The host UI invokes it through `pkexec`, which asks for ordinary
+# administrator authentication. RemoteDexter installs NO polkit rule of its
+# own: a shipped .policy that says "allow_active=yes" is a permanent standing
+# grant, and the point of this block is that the grant is neither permanent nor
+# standing.
+#
+# WHAT IT DOES
+#   enable   install exactly the packaged udev rule, reload, retrigger uinput
+#   disable  remove exactly that rule if we own it, reload, retrigger uinput
+#   status   report, change nothing
+#
+# WHAT IT REFUSES
+#   * any argument other than one of those three words — checked FIRST, before
+#     any privileged work happens, so `--path /etc/passwd` never reaches a
+#     filesystem call
+#   * a destination that is a symlink, a directory, a non-regular file, not
+#     root-owned, group/world-writable, or holds content we did not write
+#
+# It never calls usermod, never touches /dev/input/event*, never writes a unit,
+# never starts a daemon, and never opens a socket. The grant it installs is
+# uaccess on /dev/uinput for the active local seat, and nothing else.
+#
+# WHY DISABLE DOES MORE THAN DELETE A FILE
+# Removing the rule does not remove the access. systemd's uaccess builtin runs
+# when a device carrying the tag is processed and it SETS an ACL; nothing runs
+# to take one away when the tag stops being there. Measured in the harness on
+# 2026-08-23: after `disable`, /dev/uinput still carried `user:baxter:rw-` and
+# the seat user could still open it, for the rest of that login session. A
+# disable that leaves the user able to inject is a disable that lied. So the
+# ACL is cleared explicitly and the device is then re-triggered, which lets any
+# OTHER rule still tagging it re-apply its own grant — the state is re-derived
+# from the current rule set rather than assumed.
+#
+# Output is key=value lines on stdout, one per line, for machine parsing. It
+# prints no path the caller supplied (it accepts none) and no credential.
+#
+# Exit codes:
+#   0  the requested state now holds, or holds as far as this session allows —
+#      read access_now and session_refresh_required rather than the code alone
+#   2  refused: bad arguments (nothing privileged was attempted)
+#   3  refused: unsafe existing state at the destination
+#   4  failed: an operation that should have worked did not
+#   5  refused: not running as root
+
+set -u
+
+# ── Fixed constants. Deliberately not overridable — not by argument, not by
+# environment. A helper that can be told where to write is a helper that can be
+# told to write anywhere.
+RULE_DIR='/etc/udev/rules.d'
+DEST='/etc/udev/rules.d/70-remotedexter-uinput.rules'
+SRC='/usr/share/remotedexter/70-remotedexter-uinput.rules'
+TMP_PREFIX='/etc/udev/rules.d/.70-remotedexter-uinput.rules.tmp.'
+UINPUT_DEV='/dev/uinput'
+UINPUT_SYSPATH='/sys/devices/virtual/misc/uinput'
+HELPER_VERSION='1'
+
+emit() { printf '%s\n' "$*"; }
+
+# ── 1. Arguments, before anything else ──────────────────────────────────────
+# This is the first executable statement that looks at the outside world. There
+# is no path parsing, no file access and no privilege check above it, so a
+# hostile argument cannot reach any of them.
+if [ "$#" -ne 1 ]; then
+    emit "rd_helper_version=$HELPER_VERSION"
+    emit 'result=refused_bad_arguments'
+    emit 'reason=exactly_one_action_required'
+    emit 'accepted_actions=enable,disable,status'
+    exit 2
+fi
+case "$1" in
+    enable|disable|status) ACTION="$1" ;;
+    *)
+        emit "rd_helper_version=$HELPER_VERSION"
+        emit 'result=refused_bad_arguments'
+        emit 'reason=unknown_action'
+        emit 'accepted_actions=enable,disable,status'
+        exit 2
+        ;;
+esac
+
+emit "rd_helper_version=$HELPER_VERSION"
+emit "action=$ACTION"
+emit "rule_path=$DEST"
+
+# ── 2. Privilege ────────────────────────────────────────────────────────────
+if [ "$(id -u)" != '0' ]; then
+    emit 'result=refused_not_root'
+    exit 5
+fi
+
+# ── 3. Who uaccess will actually grant to ───────────────────────────────────
+# The authoritative answer is the user of the active session on the local seat,
+# because that is precisely who systemd's uaccess builtin sets the ACL for. The
+# pkexec/sudo environment is only a fallback for reporting, and is never used to
+# decide whether to do privileged work.
+TARGET_UID=''
+TARGET_UID_SOURCE='none'
+seat_session="$(loginctl show-seat seat0 -p ActiveSession --value 2>/dev/null || true)"
+if [ -n "$seat_session" ] && [ "$seat_session" != 'null' ]; then
+    seat_uid="$(loginctl show-session "$seat_session" -p User --value 2>/dev/null || true)"
+    case "$seat_uid" in
+        ''|*[!0-9]*) ;;
+        *) TARGET_UID="$seat_uid"; TARGET_UID_SOURCE='active_seat' ;;
+    esac
+fi
+if [ -z "$TARGET_UID" ]; then
+    for candidate in "${PKEXEC_UID:-}" "${SUDO_UID:-}"; do
+        case "$candidate" in
+            ''|*[!0-9]*) ;;
+            *) TARGET_UID="$candidate"; TARGET_UID_SOURCE='invoking_user'; break ;;
+        esac
+    done
+fi
+emit "target_uid=${TARGET_UID:-none}"
+emit "target_uid_source=$TARGET_UID_SOURCE"
+
+# Can that user actually open /dev/uinput for writing right now? Asked by
+# becoming them and opening it, not by reading an ACL and reasoning about it.
+# The open creates no device: uinput materializes a device only after the
+# UI_DEV_CREATE ioctl.
+probe_access() {
+    if [ ! -e "$UINPUT_DEV" ]; then
+        printf 'absent'
+        return
+    fi
+    if [ -z "$TARGET_UID" ]; then
+        printf 'unknown'
+        return
+    fi
+    target_name="$(getent passwd "$TARGET_UID" | cut -d: -f1)"
+    if [ -z "$target_name" ]; then
+        printf 'unknown'
+        return
+    fi
+    if runuser -u "$target_name" -- sh -c "exec 3>$UINPUT_DEV" 2>/dev/null; then
+        printf 'granted'
+    else
+        printf 'denied'
+    fi
+}
+
+# ── 4. What is at the destination ───────────────────────────────────────────
+# -L is tested before -e on purpose: -e follows symlinks, so a symlink to a
+# missing file would otherwise read as "absent" and be replaced by a write that
+# followed the link.
+inspect_dest() {
+    if [ -L "$DEST" ]; then printf 'symlink'; return; fi
+    if [ ! -e "$DEST" ]; then printf 'absent'; return; fi
+    if [ -d "$DEST" ]; then printf 'directory'; return; fi
+    if [ ! -f "$DEST" ]; then printf 'not_regular'; return; fi
+    owner="$(stat -c '%u:%g' "$DEST" 2>/dev/null || printf 'x')"
+    if [ "$owner" != '0:0' ]; then printf 'wrong_owner'; return; fi
+    mode="$(stat -c '%a' "$DEST" 2>/dev/null || printf 'x')"
+    case "$mode" in
+        644|640|600|444|440|400) ;;
+        *) printf 'unsafe_mode'; return ;;
+    esac
+    if [ ! -r "$SRC" ]; then printf 'unknown_no_reference'; return; fi
+    if cmp -s "$DEST" "$SRC"; then printf 'ours'; else printf 'foreign_content'; fi
+}
+
+refuse_unsafe() {
+    emit "rule_state=$1"
+    emit 'result=refused_unsafe_existing_state'
+    emit "reason=$1"
+    exit 3
+}
+
+# Clear the uaccess ACL from the one device this helper is about. Called only
+# on disable, only on a fixed literal path, and always followed by a retrigger
+# so that a grant some other rule is entitled to make comes straight back.
+revoke_acl() {
+    if [ ! -e "$UINPUT_DEV" ]; then
+        emit 'acl_reset=device_absent'
+        return 0
+    fi
+    if ! command -v setfacl >/dev/null 2>&1; then
+        # Honest, not fatal: the rule is gone, so the grant will not survive
+        # this login session. Saying "disabled" outright would still be false.
+        emit 'acl_reset=unavailable'
+        return 0
+    fi
+    if setfacl -b "$UINPUT_DEV" >/dev/null 2>&1; then
+        emit 'acl_reset=ok'
+    else
+        emit 'acl_reset=failed'
+    fi
+    return 0
+}
+
+# ── 5. udev ─────────────────────────────────────────────────────────────────
+# The trigger is aimed at exactly one device. `udevadm trigger` with no filter
+# re-runs rules for every device on the machine, which is a far larger action
+# than this helper is allowed to take.
+reload_rules() {
+    if udevadm control --reload-rules >/dev/null 2>&1; then
+        emit 'udev_reload=ok'
+        return 0
+    fi
+    emit 'udev_reload=failed'
+    return 1
+}
+
+# One retrigger of one device. `$1` is a label so a second pass reports under
+# its own key instead of overwriting the first.
+retrigger() {
+    if [ -e "$UINPUT_SYSPATH" ]; then
+        if udevadm trigger --action=change "$UINPUT_SYSPATH" >/dev/null 2>&1; then
+            emit "udev_trigger$1=ok"
+        else
+            emit "udev_trigger$1=failed"
+            return 1
+        fi
+    elif udevadm trigger --action=change --subsystem-match=misc --sysname-match=uinput >/dev/null 2>&1; then
+        emit "udev_trigger$1=ok"
+    else
+        emit "udev_trigger$1=failed"
+        return 1
+    fi
+    udevadm settle --timeout=10 >/dev/null 2>&1 || true
+    return 0
+}
+
+reload_and_trigger() {
+    reload_rules || return 1
+    retrigger '' || return 1
+    return 0
+}
+
+# Report the resulting access truthfully. "installed" is not "working": if
+# logind has not applied the ACL to this session, say so instead of implying
+# the user can go ahead.
+report_access() {
+    access="$(probe_access)"
+    emit "uinput_present=$([ -e "$UINPUT_DEV" ] && printf 'yes' || printf 'no')"
+    emit "access_now=$access"
+    case "$1:$access" in
+        enabled:granted)  emit 'session_refresh_required=no' ;;
+        enabled:denied)   emit 'session_refresh_required=yes' ;;
+        enabled:absent)   emit 'session_refresh_required=yes' ;;
+        enabled:unknown)  emit 'session_refresh_required=unknown' ;;
+        *)                emit 'session_refresh_required=no' ;;
+    esac
+}
+
+# Remove abandoned temporaries from an interrupted earlier run. They are
+# invisible to udev — it reads only names ending in .rules — but leaving litter
+# in a system directory is its own small lie about what happened here. Only
+# regular, non-symlink files matching the fixed prefix are touched.
+sweep_temporaries() {
+    for leftover in "$TMP_PREFIX"*; do
+        [ -e "$leftover" ] || continue
+        [ -L "$leftover" ] && continue
+        [ -f "$leftover" ] || continue
+        rm -f "$leftover"
+    done
+}
+
+case "$ACTION" in
+    status)
+        state="$(inspect_dest)"
+        emit "rule_state=$state"
+        report_access "$([ "$state" = 'ours' ] && printf 'enabled' || printf 'not_enabled')"
+        emit 'result=ok'
+        exit 0
+        ;;
+
+    enable)
+        if [ ! -r "$SRC" ]; then
+            emit 'rule_state=unknown'
+            emit 'result=failed'
+            emit 'reason=missing_packaged_rule'
+            exit 4
+        fi
+        state="$(inspect_dest)"
+        case "$state" in
+            ours)
+                emit 'rule_state=unchanged'
+                ;;
+            absent)
+                sweep_temporaries
+                tmp="$TMP_PREFIX$$"
+                # Written, flushed, permissioned, and only then renamed into
+                # place. rename(2) within one directory is atomic, so an
+                # interruption leaves either no rule or the whole rule — never
+                # half of one. The temporary name does not end in .rules, so
+                # udev would not read it even if the machine died mid-write.
+                if ! ( umask 022; cat "$SRC" > "$tmp" ) 2>/dev/null; then
+                    rm -f "$tmp"
+                    emit 'rule_state=absent'
+                    emit 'result=failed'
+                    emit 'reason=write_failed'
+                    exit 4
+                fi
+                chown 0:0 "$tmp" 2>/dev/null || true
+                chmod 0644 "$tmp" 2>/dev/null || true
+                sync "$tmp" 2>/dev/null || true
+                if ! mv -f "$tmp" "$DEST" 2>/dev/null; then
+                    rm -f "$tmp"
+                    emit 'rule_state=absent'
+                    emit 'result=failed'
+                    emit 'reason=install_failed'
+                    exit 4
+                fi
+                sync "$RULE_DIR" 2>/dev/null || sync
+                emit 'rule_state=installed'
+                ;;
+            *)
+                refuse_unsafe "$state"
+                ;;
+        esac
+        if ! reload_and_trigger; then
+            report_access enabled
+            emit 'result=failed'
+            emit 'reason=udev_refresh_failed'
+            exit 4
+        fi
+        report_access enabled
+        emit 'result=ok'
+        exit 0
+        ;;
+
+    disable)
+        state="$(inspect_dest)"
+        case "$state" in
+            absent)
+                emit 'rule_state=absent'
+                ;;
+            ours)
+                if ! rm -f "$DEST" 2>/dev/null; then
+                    emit 'rule_state=ours'
+                    emit 'result=failed'
+                    emit 'reason=remove_failed'
+                    exit 4
+                fi
+                sync "$RULE_DIR" 2>/dev/null || sync
+                emit 'rule_state=removed'
+                ;;
+            *)
+                # Refusing here matters more than refusing on enable. Something
+                # else owns this filename; deleting it would be RemoteDexter
+                # removing a stranger's system configuration.
+                refuse_unsafe "$state"
+                ;;
+        esac
+        sweep_temporaries
+        # ORDER IS LOAD-BEARING, and the first version of this had it wrong.
+        #
+        # Clearing the ACL before reloading loses the race: `udevadm control
+        # --reload-rules` is asynchronous, so the retrigger that follows can be
+        # processed under the OLD rule set — the one still carrying our uaccess
+        # tag — and hand the grant straight back. Measured on 2026-08-23: the
+        # first disable reported acl_reset=ok and access_now=granted, and only
+        # a SECOND disable actually revoked anything.
+        #
+        # So: reload and retrigger first, so the device is re-derived from the
+        # rule set that no longer includes ours; then clear whatever ACL is
+        # left; then retrigger once more, so any OTHER rule still entitled to
+        # grant this device gets to re-apply its own. What remains afterwards is
+        # exactly what the current rules say, and that is what gets reported.
+        if ! reload_and_trigger; then
+            revoke_acl
+            report_access not_enabled
+            emit 'result=failed'
+            emit 'reason=udev_refresh_failed'
+            exit 4
+        fi
+        revoke_acl
+        retrigger '_recheck' || true
+        report_access not_enabled
+        emit 'result=ok'
+        exit 0
+        ;;
+esac
+
+emit 'result=failed'
+emit 'reason=unreachable'
+exit 4

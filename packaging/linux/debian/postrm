@@ -1,0 +1,117 @@
+#!/bin/sh
+# RemoteDexter postrm.
+#
+#   remove  — leave the optional grant alone. It is user-chosen state, treated
+#             the way Debian treats configuration: an upgrade or a reinstall
+#             must not silently revoke something the user turned on.
+#   purge   — remove it, but only if it is unmistakably the file we wrote.
+#
+# WHY THE EXPECTED CONTENT IS DUPLICATED HERE
+# On purge, dpkg has already removed the package's files, so
+# /usr/share/remotedexter/70-remotedexter-uinput.rules is gone and
+# /usr/libexec/remotedexter/remotedexter-enable-input cannot be called to do
+# this. The expected bytes therefore have to live inside this script. A unit
+# test (host_app input_grant::tests::postrm_expects_the_packaged_rule_byte_for_byte)
+# asserts this copy is byte-identical to the packaged rule, so the two cannot
+# drift apart unnoticed.
+#
+# It removes exactly one known path, and only when that path is a regular,
+# non-symlink, root-owned file whose content matches. It sweeps no directories,
+# touches no home directory, and changes no group.
+
+set -e
+
+DEST='/etc/udev/rules.d/70-remotedexter-uinput.rules'
+TMP_PREFIX='/etc/udev/rules.d/.70-remotedexter-uinput.rules.tmp.'
+
+expected_rule() {
+    cat <<'RDX_RULE_EOF'
+# RemoteDexter optional input grant.
+#
+# This file is NOT installed by package installation. It is written to
+# /etc/udev/rules.d only by an explicit "Enable input" action in the host UI,
+# and removed by "Disable input" or by `apt purge`.
+#
+# uaccess grants the user of the ACTIVE LOCAL SEAT write access to the virtual
+# input device. It grants nothing on /dev/input/event*, so physical keyboards
+# and mice stay unreadable — which is the whole reason this exists instead of
+# `usermod -aG input`.
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess"
+RDX_RULE_EOF
+}
+
+purge_optional_rule() {
+    # A stranger's file at our path is not ours to delete. Leaving it is the
+    # safe outcome, and a purge that could not complete a cleanup is still a
+    # successful purge — exiting non-zero here would leave the package
+    # half-removed for a reason that has nothing to do with the package.
+    if [ -L "$DEST" ]; then
+        echo "remotedexter: $DEST is a symlink; left untouched" >&2
+        return 0
+    fi
+    [ -e "$DEST" ] || return 0
+    if [ ! -f "$DEST" ]; then
+        echo "remotedexter: $DEST is not a regular file; left untouched" >&2
+        return 0
+    fi
+    if [ "$(stat -c '%u:%g' "$DEST" 2>/dev/null || echo x)" != '0:0' ]; then
+        echo "remotedexter: $DEST is not root-owned; left untouched" >&2
+        return 0
+    fi
+    if ! expected_rule | cmp -s - "$DEST"; then
+        echo "remotedexter: $DEST does not match the rule RemoteDexter installs; left untouched" >&2
+        return 0
+    fi
+    rm -f "$DEST"
+
+    for leftover in "$TMP_PREFIX"*; do
+        [ -e "$leftover" ] || continue
+        [ -L "$leftover" ] && continue
+        [ -f "$leftover" ] || continue
+        rm -f "$leftover"
+    done
+
+    # Deleting the rule does not delete the access it caused. systemd's uaccess
+    # builtin only ever SETS an ACL; nothing revokes one when the tag goes away,
+    # so a purge that stops at `rm` leaves the machine granting /dev/uinput
+    # until the next logout.
+    #
+    # The order below matches the helper's, and for the same measured reason:
+    # `udevadm control --reload-rules` is asynchronous, so clearing the ACL
+    # first loses the race — the retrigger runs under the old rule set and hands
+    # the grant straight back. Reload and retrigger first, then clear, then
+    # retrigger once more so any other rule still entitled to grant this device
+    # re-applies its own.
+    #
+    # All best effort. udev may not be running (container, chroot), and that is
+    # not a purge failure: the rule is already gone from disk either way.
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload-rules >/dev/null 2>&1 || true
+        udevadm trigger --action=change --subsystem-match=misc --sysname-match=uinput >/dev/null 2>&1 || true
+        udevadm settle --timeout=10 >/dev/null 2>&1 || true
+    fi
+    if command -v setfacl >/dev/null 2>&1 && [ -e /dev/uinput ]; then
+        setfacl -b /dev/uinput >/dev/null 2>&1 || true
+    fi
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm trigger --action=change --subsystem-match=misc --sysname-match=uinput >/dev/null 2>&1 || true
+        udevadm settle --timeout=10 >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
+case "$1" in
+    purge)
+        purge_optional_rule
+        ;;
+    remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        ;;
+    *)
+        echo "postrm called with unknown argument '$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

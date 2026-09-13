@@ -1,0 +1,467 @@
+{
+  "version": 1,
+  "note": [
+    "The Android client's input wire format, pinned from both sides.",
+    "Kotlin: apk/app/src/test/java/com/remotedexter/InputJsonContractTest.kt asserts",
+    "        InputJson produces these commands.",
+    "Rust:   modules/module10/tests/android_wire_contract.rs asserts the host's own",
+    "        serde derives accept them and reject everything in must_not_parse.",
+    "Neither side imports the other. The file is the contract; drift on either",
+    "side turns that side's suite red instead of failing silently on a device.",
+    "Block 11 added TextInput. The phone sends TEXT, not scan codes: a scan code names a physical key position and only the host knows which position produces which character, so the mapping lives in module10::keymap and the wire carries what the user actually typed.",
+    "2026-08-30: added the three scroll cases. MouseScroll is NOT a new wire message - the host has accepted and injected it since Block 7, coarse detents and hi-res, both axes. What was missing was any client that sent one: two fingers went to onZoomPan, marked 'no host traffic', so a swipe moved the rendered picture and never left the phone. This is a builder joining a message that was already contracted on the Rust side. Lines rather than Pixels because a two-finger swipe has already been quantised into detents by the time it reaches the wire, and sending pixels would mean inventing a hi-res figure this path does not have."
+  ],
+  "valid": [
+    {
+      "name": "move_relative_positive",
+      "builder": "moveRelative",
+      "window": 42,
+      "args": [
+        3,
+        7
+      ],
+      "command": {
+        "type": "input_event",
+        "window": 42,
+        "event": {
+          "MouseMove": {
+            "mode": "Relative",
+            "dx": 3,
+            "dy": 7,
+            "abs_x": 0,
+            "abs_y": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "move_relative_negative",
+      "builder": "moveRelative",
+      "window": 42,
+      "args": [
+        -3,
+        -7
+      ],
+      "command": {
+        "type": "input_event",
+        "window": 42,
+        "event": {
+          "MouseMove": {
+            "mode": "Relative",
+            "dx": -3,
+            "dy": -7,
+            "abs_x": 0,
+            "abs_y": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "move_relative_desktop_surface_id",
+      "builder": "moveRelative",
+      "window": 9223372036854775807,
+      "args": [
+        1,
+        0
+      ],
+      "command": {
+        "type": "input_event",
+        "window": 9223372036854775807,
+        "event": {
+          "MouseMove": {
+            "mode": "Relative",
+            "dx": 1,
+            "dy": 0,
+            "abs_x": 0,
+            "abs_y": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "left_button_down",
+      "builder": "button",
+      "window": 42,
+      "args": [
+        0,
+        "Down"
+      ],
+      "command": {
+        "type": "input_event",
+        "window": 42,
+        "event": {
+          "MouseButton": {
+            "button": 0,
+            "action": "Down"
+          }
+        }
+      }
+    },
+    {
+      "name": "left_button_up",
+      "builder": "button",
+      "window": 42,
+      "args": [
+        0,
+        "Up"
+      ],
+      "command": {
+        "type": "input_event",
+        "window": 42,
+        "event": {
+          "MouseButton": {
+            "button": 0,
+            "action": "Up"
+          }
+        }
+      }
+    },
+    {
+      "name": "right_button_down",
+      "builder": "button",
+      "window": 42,
+      "args": [
+        1,
+        "Down"
+      ],
+      "command": {
+        "type": "input_event",
+        "window": 42,
+        "event": {
+          "MouseButton": {
+            "button": 1,
+            "action": "Down"
+          }
+        }
+      }
+    },
+    {
+      "name": "move_absolute_origin",
+      "builder": "moveAbsolute",
+      "window": 42,
+      "args": [
+        0,
+        0
+      ],
+      "command": {
+        "type": "input_event",
+        "window": 42,
+        "event": {
+          "MouseMove": {
+            "mode": "Absolute",
+            "dx": 0,
+            "dy": 0,
+            "abs_x": 0,
+            "abs_y": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "move_absolute_typical",
+      "builder": "moveAbsolute",
+      "window": 42,
+      "args": [
+        1280,
+        720
+      ],
+      "command": {
+        "type": "input_event",
+        "window": 42,
+        "event": {
+          "MouseMove": {
+            "mode": "Absolute",
+            "dx": 0,
+            "dy": 0,
+            "abs_x": 1280,
+            "abs_y": 720
+          }
+        }
+      }
+    },
+    {
+      "name": "move_absolute_desktop_surface_id",
+      "builder": "moveAbsolute",
+      "window": 9223372036854775807,
+      "args": [
+        1919,
+        1079
+      ],
+      "command": {
+        "type": "input_event",
+        "window": 9223372036854775807,
+        "event": {
+          "MouseMove": {
+            "mode": "Absolute",
+            "dx": 0,
+            "dy": 0,
+            "abs_x": 1919,
+            "abs_y": 1079
+          }
+        }
+      }
+    },
+    {
+      "name": "text_simple",
+      "builder": "text",
+      "window": 42,
+      "args": [
+        "hello"
+      ],
+      "command": {
+        "type": "input_event",
+        "window": 42,
+        "event": {
+          "TextInput": {
+            "text": "hello"
+          }
+        }
+      }
+    },
+    {
+      "name": "text_with_quotes_and_backslash",
+      "builder": "text",
+      "window": 42,
+      "args": [
+        "say \"hi\" \\ now"
+      ],
+      "command": {
+        "type": "input_event",
+        "window": 42,
+        "event": {
+          "TextInput": {
+            "text": "say \"hi\" \\ now"
+          }
+        }
+      }
+    },
+    {
+      "name": "text_with_newline_and_tab",
+      "builder": "text",
+      "window": 42,
+      "args": [
+        "a\n\tb"
+      ],
+      "command": {
+        "type": "input_event",
+        "window": 42,
+        "event": {
+          "TextInput": {
+            "text": "a\n\tb"
+          }
+        }
+      }
+    },
+    {
+      "name": "text_empty",
+      "builder": "text",
+      "window": 42,
+      "args": [
+        ""
+      ],
+      "command": {
+        "type": "input_event",
+        "window": 42,
+        "event": {
+          "TextInput": {
+            "text": ""
+          }
+        }
+      }
+    },
+    {
+      "name": "key_backspace_down",
+      "builder": "key",
+      "window": 42,
+      "args": [
+        14,
+        "Down",
+        0
+      ],
+      "command": {
+        "type": "input_event",
+        "window": 42,
+        "event": {
+          "KeyEvent": {
+            "scan_code": 14,
+            "action": "Down",
+            "modifiers": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "key_backspace_up",
+      "builder": "key",
+      "window": 42,
+      "args": [
+        14,
+        "Up",
+        0
+      ],
+      "command": {
+        "type": "input_event",
+        "window": 42,
+        "event": {
+          "KeyEvent": {
+            "scan_code": 14,
+            "action": "Up",
+            "modifiers": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "scroll_up_one_notch",
+      "builder": "scroll",
+      "window": 42,
+      "args": [
+        0,
+        1
+      ],
+      "command": {
+        "type": "input_event",
+        "window": 42,
+        "event": {
+          "MouseScroll": {
+            "dx": 0,
+            "dy": 1,
+            "mode": "Lines"
+          }
+        }
+      }
+    },
+    {
+      "name": "scroll_down_several_notches",
+      "builder": "scroll",
+      "window": 42,
+      "args": [
+        0,
+        -3
+      ],
+      "command": {
+        "type": "input_event",
+        "window": 42,
+        "event": {
+          "MouseScroll": {
+            "dx": 0,
+            "dy": -3,
+            "mode": "Lines"
+          }
+        }
+      }
+    },
+    {
+      "name": "scroll_sideways",
+      "builder": "scroll",
+      "window": 42,
+      "args": [
+        2,
+        0
+      ],
+      "command": {
+        "type": "input_event",
+        "window": 42,
+        "event": {
+          "MouseScroll": {
+            "dx": 2,
+            "dy": 0,
+            "mode": "Lines"
+          }
+        }
+      }
+    }
+  ],
+  "must_not_parse": [
+    {
+      "name": "mouse_move_missing_abs_fields",
+      "event": {
+        "MouseMove": {
+          "mode": "Relative",
+          "dx": 1,
+          "dy": 1
+        }
+      },
+      "why": "serde has no default for abs_x/abs_y; omitting them in Relative mode is rejected outright. This is the most likely real-world drift: they look ignorable."
+    },
+    {
+      "name": "unit_variant_written_as_an_object",
+      "event": {
+        "FocusGained": {}
+      },
+      "why": "unit variants serialize as the bare string \"FocusGained\", not an empty object"
+    },
+    {
+      "name": "unknown_button_action",
+      "event": {
+        "MouseButton": {
+          "button": 0,
+          "action": "Press"
+        }
+      },
+      "why": "ButtonAction is exactly Up or Down"
+    },
+    {
+      "name": "unknown_move_mode",
+      "event": {
+        "MouseMove": {
+          "mode": "Trackpad",
+          "dx": 1,
+          "dy": 1,
+          "abs_x": 0,
+          "abs_y": 0
+        }
+      },
+      "why": "MouseMoveMode is exactly Relative or Absolute"
+    },
+    {
+      "name": "internally_tagged_shape",
+      "event": {
+        "type": "MouseButton",
+        "button": 0,
+        "action": "Down"
+      },
+      "why": "the enum is externally tagged; a type-field shape is a different encoding entirely"
+    },
+    {
+      "name": "mouse_move_absolute_negative_coordinate",
+      "why": "abs_x/abs_y are u32 host-side; a negative coordinate must be refused, never wrapped",
+      "command": {
+        "MouseMove": {
+          "mode": "Absolute",
+          "dx": 0,
+          "dy": 0,
+          "abs_x": -1,
+          "abs_y": 5
+        }
+      }
+    },
+    {
+      "name": "text_input_missing_text",
+      "event": {
+        "TextInput": {}
+      },
+      "why": "serde has no default for `text`; an empty object is not an empty string. Accepting it would turn a client bug into a silent no-op."
+    },
+    {
+      "name": "text_input_wrong_type",
+      "event": {
+        "TextInput": {
+          "text": 42
+        }
+      },
+      "why": "`text` is a String. A number here means the client built the command wrongly, and coercing it would type something nobody asked for."
+    },
+    {
+      "name": "key_event_lowercase_action",
+      "event": {
+        "KeyEvent": {
+          "scan_code": 14,
+          "action": "down",
+          "modifiers": 0
+        }
+      },
+      "why": "KeyAction serialises as `Down`/`Up`. Lower case is the drift a hand-written client produces, and accepting it would mean the two sides no longer agree on one spelling."
+    }
+  ]
+}

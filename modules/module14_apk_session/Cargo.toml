@@ -1,0 +1,39 @@
+[package]
+name = "module14_apk_session"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+
+# ── Features ────────────────────────────────────────────────────────────────
+#
+# `media_ingest` exports two C entry points — `rd_on_camera_frame` and
+# `rd_on_mic_frame` — that take a raw pointer and push camera or microphone
+# bytes into the session engine.
+#
+# It is OFF BY DEFAULT because RemoteDexter must not ship them. That build's
+# whole distinguishing claim, written out in its AndroidManifest, is that it is
+# NOT the VirtualOffice agent: no RECORD_AUDIO, and camera for QR pairing only.
+# An exported symbol that ingests microphone frames contradicts that in the
+# artefact a user receives, whatever the permissions say, and nothing in the
+# APK or in `rust/` ever called either one — verified with `nm -D` on the built
+# `libremotedexter.so`, where both symbols were present and unreferenced.
+#
+# The ENGINE METHODS behind them are untouched and still public. A build that
+# genuinely captures media calls `APKSessionEngine::on_camera_frame_captured`
+# directly, or turns this feature on. Narrowing the ABI is not the same as
+# removing the capability, and removing a modular build's capability is not
+# this tree's decision to make.
+[features]
+default = []
+media_ingest = []
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+thiserror = "2"
+module13_transport = { path = "../module13_transport" }
+lazy_static = "1.4"
+bytes = "1"
+
+[lib]
+name = "module14_apk_session"
+path = "src/lib.rs"

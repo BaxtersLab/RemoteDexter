@@ -1,0 +1,11 @@
+6ead554ecac8df7eb34ad21d1bbb28fc3ab7938c13028aff40cba396a55e14aa  RemoteDexter-3.0.1-diag.apk
+da0820dbe4b95f05df1a434a76a43492109985adcdedd38a7046ef116d8ec160  RemoteDexter-3.0.2-fulldesktop.apk
+d9ec922523b3459b0bc5c9f73a68a6d7534de9ad3be8a0dc5f85f6485f8bde71  RemoteDexter-3.0.3-unpair.apk
+
+# Published RemoteDexter APKs, kept on disk but NOT tracked in git (they are
+# 14 MB build artifacts each). This file is tracked, and it is the record that
+# matters: three separate builds once all called themselves "3.0.0 /
+# versionCode 1" and were distinguishable ONLY by digest, and installing the
+# wrong one produced an "Invalid QR" failure that cost two full test rounds.
+#
+# Add a line here for every artifact that leaves this box.

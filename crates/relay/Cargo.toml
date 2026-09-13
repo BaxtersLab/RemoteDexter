@@ -1,0 +1,48 @@
+[package]
+name = "relay"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+# The relay SPLICES CIPHERTEXT AND NOTHING ELSE, so this crate deliberately
+# does not depend on `snow`, on `pairing`'s session types, or on anything that
+# could decrypt. It cannot read a session because it has no code that could.
+#
+# That is a structural claim, not a promise: adding a Noise implementation here
+# would be a visible dependency change in review, which is exactly the point.
+[dependencies]
+# The control-frame grammar, shared with the host. See crates/relay_proto.
+relay_proto = { path = "../relay_proto" }
+
+# Registration proof. The host already has an Ed25519 identity key; the relay
+# only ever holds public halves.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+sha2 = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+base64 = "0.22"
+tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "io-util", "sync", "time", "macros", "signal"] }
+
+# `snow` is a DEV dependency and must never become a real one.
+#
+# It is here for exactly one test: run a genuine Noise XX session through the
+# relay and prove that the bytes the relay handled contain none of the
+# plaintext. That test is the difference between claiming the relay cannot read
+# a session and showing it.
+#
+# If `snow` ever appears under [dependencies] instead, the relay has gained the
+# ability to decrypt and the whole no-trust argument is gone.
+[dev-dependencies]
+snow = "0.9"
+
+[lib]
+name = "relay"
+path = "src/lib.rs"
+
+# The server. Deliberately thin: it owns a listener, a clock and a signal
+# handler, and every decision it makes is in the library above, where it is
+# provable without a socket.
+[[bin]]
+name = "relayd"
+path = "src/bin/relayd.rs"

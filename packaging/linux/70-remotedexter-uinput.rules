@@ -1,0 +1,11 @@
+# RemoteDexter optional input grant.
+#
+# This file is NOT installed by package installation. It is written to
+# /etc/udev/rules.d only by an explicit "Enable input" action in the host UI,
+# and removed by "Disable input" or by `apt purge`.
+#
+# uaccess grants the user of the ACTIVE LOCAL SEAT write access to the virtual
+# input device. It grants nothing on /dev/input/event*, so physical keyboards
+# and mice stay unreadable — which is the whole reason this exists instead of
+# `usermod -aG input`.
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess"

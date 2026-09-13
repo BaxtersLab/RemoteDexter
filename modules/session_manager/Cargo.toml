@@ -1,0 +1,21 @@
+[package]
+name = "session_manager"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+
+[lib]
+name = "session_manager"
+path = "src/lib.rs"
+
+[features]
+debug-logs = []
+
+[dependencies]
+scp_consumer = { path = "../scp_consumer" }
+connection_package_generator = { path = "../connection_package_generator" }
+uuid = { version = "1", features = ["v4"] }
+ed25519-dalek = "2"
+sha2 = "0.10"
+sil = { path = "../../sil" }
+tokio = { version = "1", features = ["time", "sync"] }

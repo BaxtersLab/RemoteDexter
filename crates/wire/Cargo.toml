@@ -1,0 +1,14 @@
+[package]
+name = "wire"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+# ZERO DEPENDENCIES, deliberately, exactly as crates/session_core is.
+# This crate decides what may cross the encrypted link. Every byte an attacker
+# controls reaches `decode_exact` first, so the set of code that can be reached
+# by hostile input should be auditable in one sitting without a network, a
+# parser generator, or any third-party code in the path. That is also why the
+# control-JSON check is a hand-written scanner rather than a serde call: it
+# needs to bound depth BEFORE anything builds a tree.
+[dependencies]

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Toolbar icon ink.
+
+  Its job is the INK COLOUR, so the icons follow the theme rather than being
+  hard-coded black.
+
+  It is NOT what dims an unavailable icon, though it was written expecting to
+  be. On the real device the disabled row never reached the screen: Keyboard and
+  Screenshot rendered at full black with isEnabled false. The row is kept
+  because it is correct and costs nothing, but the dimming that the user
+  actually sees is MainActivity.setAvailable applying imageAlpha, which is
+  asserted by rendering the button rather than by reading this file.
+-->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item
+        android:state_enabled="false"
+        android:alpha="0.3"
+        android:color="?android:attr/textColorPrimary" />
+    <item android:color="?android:attr/textColorPrimary" />
+</selector>

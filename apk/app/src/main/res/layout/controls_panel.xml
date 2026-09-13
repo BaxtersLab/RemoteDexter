@@ -1,0 +1,452 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The control panel: every button that is not the picture.
+
+  Extracted so portrait and landscape can arrange the SAME controls rather than
+  keeping two copies that drift. That is not a hypothetical worry in this tree —
+  four copies of the Android source already live here, and the gate has a row
+  counting them.
+
+  Portrait stacks this under the desktop. Landscape puts it in a column beside
+  it, because a 16:9 desktop on a 19.5:9 phone held sideways has width to spare
+  and no height at all: with these rows across the bottom the surface was
+  measured at 1904x256 — a quarter of the screen — and the picture inside it was
+  a 455px-wide postage stamp. That is what drove the operator to pinch-zoom, and
+  the zoom is what silently disabled two-finger scrolling.
+
+  Everything below is unchanged from when it lived in activity_main.xml.
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:id="@+id/controlsPanelInner"
+    android:orientation="vertical"
+    android:layout_width="match_parent"
+    android:layout_height="@dimen/controls_panel_height">
+
+
+    <!--
+      The compact icon toolbar the plan asks for.
+
+      It was five Buttons carrying words, autosized between 7sp and 11sp so the
+      words would fit. They did not always: "Trackpad" wrapped and was cut in
+      half, and the row could not take a sixth control at all, which is why
+      Connect had to move down to the 48dp row. Five labels competing for one
+      phone-width row is a losing argument, and 7sp is not a readable size — the
+      autosizing was buying a legibility that was not there.
+
+      Icons end the argument. There is no text to clip, so each control gets a
+      real 48dp square instead of a squeezed rectangle, and the meaning moves to
+      a contentDescription and a tooltipText, neither of which has a width
+      limit. The tooltip is the discoverability the words used to provide: a
+      long press names the control, which is the standard Android gesture for
+      exactly that question.
+
+      Order is unchanged and deliberate: the two controls pressed mid-session
+      are at the left under the thumb, and Pair and Diagnostics are setup
+      actions kept at the far right with a wider gap, so the mis-tap risk is
+      handled by distance rather than by a second row.
+
+      The drawables are RemoteDexter's own, drawn as 2px stroke line art on a
+      24dp grid. No Material path data is copied.
+    -->
+    <LinearLayout
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:paddingStart="4dp"
+        android:paddingEnd="4dp"
+        android:paddingTop="2dp"
+        android:paddingBottom="2dp"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content">
+
+        <!-- Live link indicator: the operator asked to see at a glance whether a
+             device is actually attached, rather than inferring it from whether
+             the picture is moving. Updated by MainActivity. -->
+        <TextView
+            android:id="@+id/linkIndicator"
+            android:text="@string/link_idle"
+            android:textSize="11sp"
+            android:minWidth="0dp"
+            android:paddingStart="4dp"
+            android:paddingEnd="6dp"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"/>
+
+
+        <ImageButton
+            android:id="@+id/btnPointerMode"
+            android:src="@drawable/ic_pointer_touch"
+            android:tint="@color/toolbar_icon"
+            android:contentDescription="@string/pointer_touch_description"
+            android:tooltipText="@string/pointer_touch"
+            android:scaleType="centerInside"
+            android:padding="10dp"
+            android:background="?android:attr/selectableItemBackgroundBorderless"
+            android:layout_width="0dp"
+            android:layout_weight="1"
+            android:layout_height="48dp"
+            android:layout_marginStart="3dp"/>
+
+        <ImageButton
+            android:id="@+id/btnKeyboard"
+            android:src="@drawable/ic_keyboard"
+            android:tint="@color/toolbar_icon"
+            android:contentDescription="@string/keyboard_description"
+            android:tooltipText="@string/keyboard"
+            android:scaleType="centerInside"
+            android:padding="10dp"
+            android:background="?android:attr/selectableItemBackgroundBorderless"
+            android:layout_width="0dp"
+            android:layout_weight="1"
+            android:layout_height="48dp"
+            android:layout_marginStart="3dp"/>
+
+        <ImageButton
+            android:id="@+id/btnPair"
+            android:src="@drawable/ic_pair_qr"
+            android:tint="@color/toolbar_icon"
+            android:contentDescription="@string/pair_description"
+            android:tooltipText="@string/pair_scan_qr"
+            android:scaleType="centerInside"
+            android:padding="10dp"
+            android:background="?android:attr/selectableItemBackgroundBorderless"
+            android:layout_width="0dp"
+            android:layout_weight="1"
+            android:layout_height="48dp"
+            android:layout_marginStart="6dp"/>
+
+        <ImageButton
+            android:id="@+id/btnDiagnostics"
+            android:src="@drawable/ic_diagnostics"
+            android:tint="@color/toolbar_icon"
+            android:contentDescription="@string/diagnostics_description"
+            android:tooltipText="@string/diagnostics"
+            android:scaleType="centerInside"
+            android:padding="10dp"
+            android:background="?android:attr/selectableItemBackgroundBorderless"
+            android:layout_width="0dp"
+            android:layout_weight="1"
+            android:layout_height="48dp"
+            android:layout_marginStart="3dp"/>
+    </LinearLayout>
+
+    <!--
+      The chord row: Ctrl+C, Ctrl+V, Print Screen.
+
+      Copy leads, on the operator's instruction: it is the order the two are
+      used in and the order the keys sit in on a keyboard.
+
+      These are REAL KEYSTROKES on the host, not a clipboard protocol. The
+      buttons that used to carry these labels never pressed Ctrl+C on anything
+      — btnCopy pushed the PHONE's clipboard across and btnPaste sent an empty
+      payload hoping the host would answer — and the host handler logged the
+      bytes and discarded them. Block 10 deleted that path as a stub and took
+      the operator's buttons with it without asking. These do what the labels
+      always said.
+
+      PrtScn is here for the same reason: the icon it replaces called
+      rd_request_screenshot, whose transport is never established, so it sent
+      nothing at all. Pressing the host's own Print Screen key makes the host
+      take and save the capture exactly as if someone had pressed it there.
+
+      Its own row rather than squeezed into the toolbar above: labels wide
+      enough to read do not fit beside icons, and "Ctrl+C" rendering as
+      "CTRL/+C" is a defect this row has already produced once.
+
+      The last two carry text BETWEEN the two machines' clipboards, which the
+      three chords do not: Ctrl+C copies inside the host. Arrows rather than
+      words because the row is now five wide; the full meaning is in each
+      button's content description, which has no width limit.
+    -->
+    <LinearLayout
+        android:id="@+id/chordRow"
+        android:orientation="horizontal"
+        android:paddingStart="4dp"
+        android:paddingEnd="4dp"
+        android:paddingBottom="2dp"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content">
+
+        <Button
+            android:id="@+id/btnCopyChord"
+            android:text="@string/chord_copy"
+            android:textSize="12sp"
+            android:maxLines="1"
+            android:minHeight="44dp"
+            android:minWidth="0dp"
+            android:insetLeft="0dp"
+            android:insetRight="0dp"
+            android:paddingStart="6dp"
+            android:paddingEnd="6dp"
+            android:layout_width="0dp"
+            android:layout_weight="1"
+            android:layout_height="44dp"
+            android:layout_marginStart="3dp"/>
+
+        <Button
+            android:id="@+id/btnPasteChord"
+            android:text="@string/chord_paste"
+            android:textSize="12sp"
+            android:maxLines="1"
+            android:minHeight="44dp"
+            android:minWidth="0dp"
+            android:insetLeft="0dp"
+            android:insetRight="0dp"
+            android:paddingStart="6dp"
+            android:paddingEnd="6dp"
+            android:layout_width="0dp"
+            android:layout_weight="1"
+            android:layout_height="44dp"
+            android:layout_marginStart="4dp"/>
+
+        <Button
+            android:id="@+id/btnPrintScreen"
+            android:text="@string/chord_prtscn"
+            android:textSize="12sp"
+            android:maxLines="1"
+            android:minHeight="44dp"
+            android:minWidth="0dp"
+            android:insetLeft="0dp"
+            android:insetRight="0dp"
+            android:paddingStart="6dp"
+            android:paddingEnd="6dp"
+            android:layout_width="0dp"
+            android:layout_weight="1"
+            android:layout_height="44dp"
+            android:layout_marginStart="4dp"/>
+
+        <Button
+            android:id="@+id/btnClipToHost"
+            android:text="@string/clip_to_host"
+            android:textSize="12sp"
+            android:maxLines="1"
+            android:minHeight="44dp"
+            android:minWidth="0dp"
+            android:insetLeft="0dp"
+            android:insetRight="0dp"
+            android:paddingStart="4dp"
+            android:paddingEnd="4dp"
+            android:layout_width="0dp"
+            android:layout_weight="1"
+            android:layout_height="44dp"
+            android:layout_marginStart="4dp"/>
+
+        <Button
+            android:id="@+id/btnClipFromHost"
+            android:text="@string/clip_from_host"
+            android:textSize="12sp"
+            android:maxLines="1"
+            android:minHeight="44dp"
+            android:minWidth="0dp"
+            android:insetLeft="0dp"
+            android:insetRight="0dp"
+            android:paddingStart="4dp"
+            android:paddingEnd="4dp"
+            android:layout_width="0dp"
+            android:layout_weight="1"
+            android:layout_height="44dp"
+            android:layout_marginStart="4dp"/>
+    </LinearLayout>
+
+    <!--
+      Where the last two clipboard buttons live when the phone is held sideways.
+
+      GONE in portrait, where all five fit across the width. In landscape the
+      control column is 200dp and they do not, so applyOrientation MOVES them
+      here — moves, not re-creates. Reparenting keeps the same view objects, so
+      every listener bound in onCreate survives a rotation untouched. Inflating
+      a separate landscape panel would have meant rebinding fifteen views the
+      operator had just signed off, which is a poor trade for a layout change.
+    -->
+    <LinearLayout
+        android:id="@+id/chordRow2"
+        android:orientation="horizontal"
+        android:visibility="gone"
+        android:paddingStart="4dp"
+        android:paddingEnd="4dp"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"/>
+
+    <!--
+      Control is opt-in and Disconnect is explicit. These are the two
+      session-critical actions, so neither is compressed into the toolbar's
+      targets.
+
+      SIZED TO THEIR LABELS, not stretched to a third of the row each. The row
+      used to weight all three equally, which is why "Enable Control" needed two
+      lines and autosizing down to 9sp to fit a space it had been given rather
+      than a space it needed. Short labels and wrap_content give the words room
+      at a readable size and hand the leftover width back to the screen — which
+      is what paid for the chord row above.
+
+      Settings stays at the far right, held there by the spacer rather than by a
+      weight of its own.
+    -->
+    <LinearLayout
+        android:id="@+id/controlRow"
+        android:orientation="horizontal"
+        android:paddingStart="4dp"
+        android:paddingEnd="4dp"
+        android:paddingBottom="4dp"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content">
+
+        <!--
+          The label has to fit at a third of the row. A default Button spends
+          60 of its 144px on vertical padding and wraps freely, which left
+          "Enable Control" 108px of text in 84px of space — cut in half on the
+          device. Trimmed padding buys back the room for two lines, and uniform
+          autosizing is what keeps the promise on a narrower screen instead of
+          hoping 13sp happens to fit. Measured by ControlRowFitTest.
+        -->
+        <Button
+            android:id="@+id/btnToggleControl"
+            android:text="@string/enable"
+            android:maxLines="1"
+            android:textSize="13sp"
+            android:paddingStart="12dp"
+            android:paddingEnd="12dp"
+            android:paddingTop="2dp"
+            android:paddingBottom="2dp"
+            android:minHeight="48dp"
+            android:layout_width="wrap_content"
+            android:layout_height="48dp"/>
+
+        <!--
+          Connect belongs here, not in the utility toolbar. It was tried there
+          first and the sixth button took the row below the width its labels
+          need: "Connect" rendered as "CONN/ECT" and Pair as "PAIR (SCA/N QR)"
+          on the SM-G970U. This row has three items instead of five and a
+          48dp height, so the label fits without autosizing down to nothing.
+
+          Adjacent to Disconnect on purpose. They are one decision in two
+          directions and are never both enabled, so the neighbouring button is
+          always inert — which makes the pairing safe rather than a mis-tap
+          risk, and shows the session's state without reading any text.
+        -->
+        <Button
+            android:id="@+id/btnConnect"
+            android:text="@string/connect"
+            android:maxLines="1"
+            android:textSize="13sp"
+            android:paddingStart="12dp"
+            android:paddingEnd="12dp"
+            android:insetLeft="0dp"
+            android:insetRight="0dp"
+            android:minWidth="0dp"
+            android:minHeight="48dp"
+            android:layout_width="wrap_content"
+            android:layout_height="48dp"
+            android:layout_marginStart="4dp"/>
+
+        <Button
+            android:id="@+id/btnDisconnect"
+            android:text="@string/disconnect"
+            android:maxLines="1"
+            android:textSize="13sp"
+            android:paddingStart="12dp"
+            android:paddingEnd="12dp"
+            android:insetLeft="0dp"
+            android:insetRight="0dp"
+            android:minWidth="0dp"
+            android:minHeight="48dp"
+            android:layout_width="wrap_content"
+            android:layout_height="48dp"
+            android:layout_marginStart="4dp"/>
+
+        <!-- Takes the width the labels did not need, so Settings ends up at
+             the edge and the three session controls stay their own size. -->
+        <View
+            android:layout_width="0dp"
+            android:layout_weight="1"
+            android:layout_height="1dp"/>
+
+        <!--
+          Settings at the far right, deliberately narrow.
+
+          It replaces the cursor-lift slider, which was taking a quarter of this
+          row for a preference set once — space Enable Control, Connect and
+          Disconnect need every session. wrap_content rather than a weight, so
+          the three session controls get what it gave up rather than splitting
+          the row four ways again.
+        -->
+        <Button
+            android:id="@+id/btnSettings"
+            android:text="@string/settings_short"
+            android:textSize="13sp"
+            android:minHeight="48dp"
+            android:minWidth="0dp"
+            android:paddingStart="10dp"
+            android:paddingEnd="10dp"
+            android:contentDescription="@string/settings"
+            android:layout_width="wrap_content"
+            android:layout_height="48dp"
+            android:layout_marginStart="4dp"/>
+
+    </LinearLayout>
+
+    <!-- The landscape home of Disconnect and Settings. See chordRow2. -->
+    <LinearLayout
+        android:id="@+id/controlRow2"
+        android:orientation="horizontal"
+        android:visibility="gone"
+        android:paddingStart="4dp"
+        android:paddingEnd="4dp"
+        android:paddingBottom="4dp"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"/>
+
+    <!--
+      The wheel, as two buttons, in the far bottom-right corner.
+
+      The operator's decision after two-finger scrolling proved unreachable:
+      *"a scroll up arrow and a scroll down arrow button but it scrolls the
+      field that the cursor is over, that's the same way the scroller on the
+      mouse works. cursor over scroll target then scroll up or down gives the
+      desired result."*
+
+      That is exactly what they send — an ordinary wheel event, which the host
+      delivers to whatever is under the pointer. No window targeting is
+      attempted and none should be: park the cursor and scroll. Held down they
+      repeat; see ScrollRepeat.
+
+      A ROW OF THEIR OWN, not the end of the row above. Tried there first and
+      measured on the SM-G970U: the session controls, Settings and the pair came
+      to more than 1080px, so the spacer collapsed, btnScrollDown was pushed off
+      the screen entirely, and the whole row was squeezed to 40px tall. The row
+      above is sized to its labels by an argument that took two attempts to get
+      right; this does not reopen it.
+    -->
+    <LinearLayout
+        android:orientation="horizontal"
+        android:gravity="end"
+        android:paddingStart="4dp"
+        android:paddingEnd="4dp"
+        android:paddingBottom="4dp"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content">
+
+        <ImageButton
+            android:id="@+id/btnScrollUp"
+            android:src="@drawable/ic_scroll_up"
+            android:scaleType="fitCenter"
+            android:padding="8dp"
+            android:background="?android:attr/selectableItemBackground"
+            android:contentDescription="@string/scroll_up"
+            android:tooltipText="@string/scroll_up"
+            android:layout_width="56dp"
+            android:layout_height="48dp"/>
+
+        <ImageButton
+            android:id="@+id/btnScrollDown"
+            android:src="@drawable/ic_scroll_down"
+            android:scaleType="fitCenter"
+            android:padding="8dp"
+            android:background="?android:attr/selectableItemBackground"
+            android:contentDescription="@string/scroll_down"
+            android:tooltipText="@string/scroll_down"
+            android:layout_width="56dp"
+            android:layout_height="48dp"
+            android:layout_marginStart="8dp"/>
+    </LinearLayout>
+</LinearLayout>

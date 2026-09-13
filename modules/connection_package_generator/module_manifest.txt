@@ -1,0 +1,11 @@
+# ============================================================
+# Module Manifest — Module 2: Connection Package Generator
+# ============================================================
+
+name: connection_package_generator
+version: 0.1.0
+status: scaffolded
+
+responsibility: "Construct connection packages from HandshakeResult and metadata for transport and Noise modules."
+
+notes: "This module consumes `HandshakeResult` from `qr_handshake` and produces connection packages for signaling and transport layers. Networking, transport logic, and Noise handshake are out-of-scope for this module; it only prepares canonical packages."

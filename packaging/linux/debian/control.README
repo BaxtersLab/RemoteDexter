@@ -1,0 +1,47 @@
+How the Depends line was derived, and why it is not ldd output
+==============================================================
+
+`ldd` reports what the linker records. It does NOT report what a process
+`dlopen`s at runtime, and the two differ here in ways that matter: the GStreamer
+plugin registry, the Wayland client, and xkbcommon all arrive that way. A
+Depends built from ldd would install and then fail at first use.
+
+So the list was taken from a RUNNING host: launch it, read /proc/PID/maps, map
+each mapped .so back to its package with `dpkg -S`. That is what the process
+actually had open, not what the linker predicted.
+
+Derived on 2026-09-01 from a live host on Ubuntu 26.04:
+
+    libatomic1  libc6  libffi8  libgcc-s1  libglib2.0-0t64
+    libgstreamer1.0-0  libgstreamer-plugins-base1.0-0  liborc-0.4-0t64
+    libpcre2-8-0  libwayland-client0  libxkbcommon0
+
+DELIBERATELY EXCLUDED -- the GPU stack:
+
+    libdrm2  libvulkan1
+
+Both were mapped, and neither belongs in Depends. They arrive with whatever
+driver the machine has (mesa, nvidia), and pinning them makes this package
+argue with the user's driver choice for no benefit.
+
+ADDED FROM THE DESIGN, not from the maps:
+
+    gstreamer1.0-pipewire       provides pipewiresrc
+    gstreamer1.0-plugins-base   provides videoconvert and appsink
+    xdg-desktop-portal          the ScreenCast portal
+    pipewire                    the stream the portal hands back
+
+A maps snapshot only shows what has been loaded SO FAR, and capture does not
+start until the operator presses Start -- so none of these appear in a snapshot
+taken at idle. The pipeline is
+`pipewiresrc fd={fd} path={node} ! videoconvert ! video/x-raw,format=RGBA ! ...`
+in modules/module11/src/capture_linux.rs, and each element was resolved to its
+package with `gst-inspect-1.0` plus `dpkg -S`.
+
+Stated plainly because it is the one part of this list that was not measured:
+it is read off the code, and it is the part most likely to rot if the pipeline
+changes.
+
+RECOMMENDS, not Depends: a portal BACKEND. xdg-desktop-portal on its own cannot
+show a picker; it needs the desktop's implementation. Which one is right depends
+on the desktop, so requiring any single one would be wrong.

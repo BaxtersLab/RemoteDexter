@@ -1,0 +1,144 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">RemoteDexter</string>
+    <string name="desktop_view_description">Remote desktop</string>
+    <string name="keyboard">Keys</string>
+    <string name="keyboard_field_description">Remote typing field</string>
+    <string name="keyboard_needs_control">Press Enable Control before typing</string>
+    <string name="compose_hint">Type, then Type or Enter</string>
+    <string name="send">Type</string>
+    <string name="pointer_touch">Touch</string>
+    <string name="pointer_trackpad">Mouse</string>
+    <string name="pointer_touch_description">Pointer mode: touch. The cursor goes where you touch.</string>
+    <string name="pointer_trackpad_description">Pointer mode: mouse. The cursor moves like a trackpad.</string>
+    <string name="state_idle_paired">Paired with %1$s — press Connect</string>
+    <string name="state_idle_unpaired">Not connected. Scan a QR to pair.</string>
+    <string name="settings">Settings</string>
+    <string name="settings_paired_hosts">Paired hosts</string>
+    <string name="settings_forget_short">Forget</string>
+    <string name="settings_add_host">Add a host</string>
+    <string name="settings_host_active">%1$s \u2014 in use</string>
+    <string name="settings_host_fingerprint">fingerprint %1$s\u2026</string>
+    <string name="settings_host_row_description">%1$s, fingerprint %2$s. Tap to connect to this host.</string>
+    <string name="settings_host_row_active_description">%1$s, fingerprint %2$s. This is the host Connect will use.</string>
+    <string name="settings_forget_one_description">Forget %1$s</string>
+    <!--
+      Arming. The wording says what actually changes, not "enabled": the
+      operator is opening a door that is otherwise shut, and the sentence has to
+      make the next step obvious or the arm expires unused.
+    -->
+    <string name="settings_enrollment_armed">Ready to add a host. Scan its QR from the main screen within %1$d minutes.</string>
+    <string name="settings_enrollment_closed">The next QR must be from a host this phone already knows. Press Add a host to pair a new one.</string>
+    <string name="settings_enrollment_first">No hosts paired yet. Scan a QR from the main screen \u2014 the first host is trusted on sight.</string>
+    <!-- settings_no_paired_host was removed: the enrollment line above covers the
+         empty case, and having both made the screen say the same thing twice. -->
+    <string name="settings_add_host_title">Add a host</string>
+    <string name="settings_add_host_body">The next QR you scan may be from a machine this phone has never seen. That is normally refused. Only continue if you are scanning a code from a computer you own.</string>
+    <string name="settings_add_host_confirm">Allow the next QR</string>
+    <string name="settings_forget_host">Forget this host</string>
+    <string name="settings_cursor_lift_help">Lifts the remote cursor above your fingertip so you can see what you are about to click.</string>
+    <string name="settings_host_detail">%1$s port %2$d</string>
+    <string name="settings_forget_body">This phone will no longer reconnect to that host, and the host will no longer recognise this phone. You will need a new QR code to pair again.</string>
+    <!--
+      Said only when OTHER pairings remain. The device identity has to stay
+      alive for them, so this phone is forgetting its own note rather than
+      withdrawing permission \u2014 and the app cannot revoke itself at the host.
+      Claiming "unpaired" here would be untrue.
+    -->
+    <string name="settings_forget_body_others_remain">This phone will stop offering to reconnect to %1$s. Because other hosts are still paired, this device keeps the identity they recognise \u2014 so that host may still accept this phone until you revoke it there.</string>
+    <string name="settings_forgot_one">Forgotten. Revoke this phone at that host to be certain.</string>
+    <string name="settings_forgotten">Unpaired</string>
+    <string name="settings_forget_incomplete">Host forgotten, but this device\'s identity could not be removed — revoke it at the host</string>
+    <!--
+      The chord row. Written as the keys they press, because that is exactly
+      what they do now — the buttons that once carried these labels pushed a
+      clipboard payload the host discarded.
+    -->
+    <string name="chord_copy">Ctrl+C</string>
+    <string name="chord_paste">Ctrl+V</string>
+    <string name="chord_prtscn">PrtScn</string>
+    <string name="chord_copy_description">Control C. Copy on the remote machine.</string>
+    <string name="chord_paste_description">Control V. Paste on the remote machine.</string>
+    <string name="chord_prtscn_description">Print Screen. The remote machine takes a screenshot.</string>
+    <!--
+      The clipboard bridge. Arrows because the row is five wide; the meaning
+      lives in the content descriptions, which have no width limit.
+    -->
+    <string name="clip_to_host">\u2192 Host</string>
+    <string name="clip_from_host">\u2190 Host</string>
+    <string name="clip_to_host_description">Send this phone\'s clipboard to the remote machine</string>
+    <string name="clip_from_host_description">Bring the remote machine\'s clipboard to this phone</string>
+    <string name="clip_sent">Sent to the host clipboard \u2014 press Ctrl+V there</string>
+    <string name="clip_received">Copied to this phone</string>
+    <string name="clip_host_empty">The host\'s clipboard is empty \u2014 this phone\'s cleared to match</string>
+    <string name="clip_nothing_to_send">Nothing copied on this phone</string>
+    <string name="clip_too_large">That selection is too large to send</string>
+    <string name="chord_needs_control">Press Enable before sending keys</string>
+    <string name="chord_needs_session">Not connected — nothing to send keys to</string>
+    <!--
+      Short. The row sizes buttons to their labels now, and "Enable Control"
+      needed two lines and 9sp to fit a width it had been given rather than one
+      it needed. The button sits beside Connect and Disconnect in a row about
+      the session, so what is being enabled is not in doubt.
+    -->
+    <string name="enable">Enable</string>
+    <string name="disable">Disable</string>
+    <string name="settings_short">⚙</string>
+    <string name="connect">Connect</string>
+    <string name="pair_scan_qr">Pair QR</string>
+    <string name="diagnostics">Diagnostics</string>
+    <!-- Both action-oriented (what tapping does), not state-oriented, so the
+         two can't be confused for each other: shown while NOT controlling,
+         tapping turns control ON; shown while controlling, tapping turns it
+         back OFF. -->
+    <string name="enable_control">Enable Control</string>
+    <string name="disable_control">Disable Control</string>
+    <string name="control_denied">Control unavailable: %1$s</string>
+     <string name="disconnect">Disconnect</string>
+    <!-- Live link indicator in the control row. Short by design: it shares one
+         compact row with six buttons. -->
+    <string name="link_idle">○ idle</string>
+    <string name="link_active">● linked</string>
+
+    <!-- Block 5: truthful lifecycle and failure states. Every one of these is a
+         state the UI renders differently; there is no "something went wrong". -->
+    <string name="state_idle">Not connected</string>
+    <string name="state_connecting">Connecting to %1$s…</string>
+    <string name="state_streaming">Connected to %1$s</string>
+    <string name="state_failed">%1$s — %2$s</string>
+    <string name="state_identity_mismatch">This host\'s identity has changed</string>
+
+    <string name="identity_mismatch_title">Host identity changed</string>
+    <string name="identity_mismatch_body">The host presented a different identity key than the one this device paired with.\n\nThis can mean the host was reinstalled — or that something else is answering at that address.\n\nExpected fingerprint:\n%1$s\n\nReceived fingerprint:\n%2$s\n\nBoth values are public keys. Nothing secret is shown here.</string>
+    <string name="unpair_and_forget">Unpair and forget…</string>
+    <string name="unpair_confirm_title">Forget this host?</string>
+    <string name="unpair_confirm_body">Forgetting removes the pinned identity for this host. The next pairing code you scan will be trusted on first use.\n\nOnly do this if you know why the identity changed.</string>
+    <string name="unpair_confirm_action">Forget host</string>
+    <string name="cancel">Cancel</string>
+    <string name="cursor_lift_label">Cursor lift above fingertip</string>
+    <string name="cursor_lift_value">Cursor lift: %1$d dp</string>
+    <string name="cursor_lift_off">Cursor lift: off</string>
+
+    <!--
+      Icon toolbar: what a screen reader announces, and what a long press shows.
+
+      The tooltip is the SHORT word — it is a hint hovering over a 48dp square
+      and has no room to be a sentence. The content description is the whole
+      meaning, because it has no width limit at all and it is the only thing a
+      user who cannot see the drawing will ever get.
+    -->
+    <string name="keyboard_description">Keyboard. Type on the remote machine.</string>
+    <string name="screenshot">Screenshot</string>
+    <string name="screenshot_description">Screenshot. Capture the remote screen.</string>
+    <string name="pair_description">Pair. Scan a host\'s QR code.</string>
+    <string name="diagnostics_description">Diagnostics. Connection and session details.</string>
+    <string name="scroll_up">Scroll up</string>
+    <string name="scroll_down">Scroll down</string>
+    <!-- AGPL-3.0 section 13: a phone driving a host over a network is a remote
+         user, and an AGPL work must prominently offer it the source.
+         RemoteDexter is AGPL-3.0-only. This is the client half; the host
+         console carries the same notice. -->
+    <string name="licence_notice">RemoteDexter \u2014 AGPL-3.0-only</string>
+    <string name="licence_source_label">Source code</string>
+    <string name="licence_source_url" translatable="false">https://baxters.vip/remotedexter/</string>
+</resources>

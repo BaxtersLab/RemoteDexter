@@ -1,0 +1,33 @@
+#!/bin/sh
+# RemoteDexter postinst.
+#
+# This script is deliberately, provably inert. It is not a stub and it is not
+# unfinished: doing nothing here IS the feature. Installing RemoteDexter must
+# change no device ACL, no group membership, no udev rule, no unit, no process,
+# no socket and no key. The optional /dev/uinput grant exists only after the
+# user asks for it in the host UI, and scripts/test-uinput-install.sh check 1
+# fails if this file ever starts granting something.
+#
+# In particular this script must never:
+#   * copy 70-remotedexter-uinput.rules into /etc/udev/rules.d
+#   * run udevadm control/trigger
+#   * call usermod, gpasswd, adduser or setfacl
+#   * enable, start or create a systemd unit
+#
+# The packaged rule ships as inert data at
+# /usr/share/remotedexter/70-remotedexter-uinput.rules and stays there.
+
+set -e
+
+case "$1" in
+    configure|abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+    *)
+        echo "postinst called with unknown argument '$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

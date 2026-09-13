@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  DEBUG-ONLY manifest additions. Merged into debug builds and NOTHING else.
+
+  The release APK is built from src/main/AndroidManifest.xml alone, which is
+  also the file the `android-exported` gate row reads — so the shipping exported
+  surface is still exactly `activity:.MainActivity`, unchanged by this file.
+
+  The one receiver below is the test affordance the operator authorised on
+  2026-09-08 so that Windows can prove the `N key(s)` half of the host's
+  shutdown message, which round 13 established the shipping client cannot
+  express. HeldKeyDebugReceiver documents why it is exported and what that does
+  and does not permit; `android-exported-debug` pins this list.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <receiver
+            android:name=".HeldKeyDebugReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.remotedexter.debug.HOLD_KEY" />
+                <action android:name="com.remotedexter.debug.RELEASE_KEY" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

@@ -1,0 +1,155 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  RemoteDexter manifest — the LEAN profile.
+
+  RemoteDexter and VirtualOffice are separate products that drifted into one
+  permission profile, and that convergence is what made three near-identical
+  "3.0.0" builds impossible to tell apart. They are kept apart here deliberately.
+
+  RemoteDexter: the phone is the *viewer/controller* of a remote desktop. It
+  scans a pairing QR, opens a pinned Noise session, and displays frames. It does
+  NOT surveil the phone and does NOT run when the user has not opened it.
+
+  VirtualOffice: the phone is a *managed agent* — remote camera, microphone,
+  boot-start, always-on. Those permissions belong to the VO build and its
+  manifest, NOT here. Anything on this list below must be justified by a
+  RemoteDexter feature. If a change wants CAMERA-for-capture, RECORD_AUDIO,
+  boot-start, or broad storage, it belongs in VO — do not add it here.
+
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Core: the session is a TCP+Noise connection to the host. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!--
+      Keep an ACTIVE remote session alive when the app is backgrounded briefly
+      (notification pulled down, another app checked). dataSync is the honest
+      type: this moves session data, it is not media playback or location. The
+      service runs only for the lifetime of a session the user started — it is
+      not launched at boot and does not persist idle.
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!--
+      Camera is for QR PAIRING ONLY (zxing scanner). RemoteDexter never captures
+      or transmits the phone's camera; that is a VirtualOffice agent feature.
+      Do not repurpose this permission for capture.
+    -->
+    <uses-permission android:name="android.permission.CAMERA" />
+
+    <!--
+      Deliberately NOT declared here — these are VirtualOffice-agent features and
+      their absence is what distinguishes the RemoteDexter build:
+        RECORD_AUDIO            remote microphone (VO)
+        RECEIVE_BOOT_COMPLETED  auto-start on boot (VO always-on)
+        READ/WRITE_EXTERNAL_STORAGE  broad legacy storage, non-functional under
+                                     scoped storage on API 34 anyway
+      Adding any of them re-converges the two builds. Don't.
+    -->
+
+    <application
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:theme="@style/AppTheme">
+
+        <!--
+          Handle rotation in place instead of being torn down and rebuilt.
+          A recreation ran InputController.reset() three times over — from
+          onDestroy, from surfaceDestroyed, and again from onCreate — while the
+          session's foreground service and the host's input grant both carried
+          on, so turning the phone silently revoked control and the client
+          disagreed with the host about who was driving. Landscape is the
+          normal way to hold a phone showing a desktop, not an edge case.
+          Proven by ControlSurvivesRotationTest.
+        -->
+        <!--
+          zxing's scanner window, subclassed only so it can carry FLAG_SECURE.
+          The QR in front of the lens encodes a live one-use pairing token, and
+          a window contributed by a library's own manifest cannot be flagged
+          from this app's code. Not exported: it is launched by ScanOptions
+          from inside this process and nothing outside has any business
+          starting a camera here.
+        -->
+        <activity
+            android:name=".SecureCaptureActivity"
+            android:exported="false"
+            android:screenOrientation="fullSensor"
+            android:stateNotNeeded="true"
+            android:theme="@style/zxing_CaptureTheme"
+            android:windowSoftInputMode="stateAlwaysHidden" />
+
+        <activity
+            android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".ResumeActivity"
+            android:exported="false" />
+
+        <!--
+            QR pairing. Not exported: an exported scanner would let any installed
+            app drive pairing, and a session must only ever start from a QR the
+            user deliberately scanned. zxing's own CaptureActivity is contributed
+            by the library's manifest and needs no entry here.
+        -->
+        <activity
+            android:name=".bootstrap18.QrScanActivity"
+            android:exported="false" />
+
+        <!--
+            Reads the in-app log back on the device. Not exported: the log names
+            hosts and pairing outcomes, and no other app has any business
+            reading it.
+        -->
+        <activity
+            android:name=".DiagnosticsActivity"
+            android:exported="false"
+            android:label="@string/diagnostics" />
+
+        <!--
+            Settings: the paired host and the cursor lift.
+
+            Not exported, for the same reason as Diagnostics and then some: it
+            names the paired host and offers a control that unpairs the device.
+            No other app has any business reaching either.
+        -->
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="false"
+            android:label="@string/settings" />
+
+        <service
+            android:name=".RDService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync">
+        </service>
+
+        <!--
+            Session-lifecycle signals (screen off/on, shutdown) so an active
+            session can react. Not boot-started. If this grows toward always-on
+            behaviour it belongs in VO instead.
+        -->
+        <receiver
+            android:name=".PowerStateReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.ACTION_SHUTDOWN" />
+                <action android:name="android.intent.action.SCREEN_OFF" />
+                <action android:name="android.intent.action.SCREEN_ON" />
+            </intent-filter>
+        </receiver>
+
+    </application>
+
+</manifest>

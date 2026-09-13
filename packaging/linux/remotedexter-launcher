@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# The installed launcher: /usr/bin/remotedexter.
+#
+# Two jobs, and nothing else. It scrubs the Snap environment, then execs the
+# host. It starts no service, opens no socket, creates no key and grants no
+# device. The host console appears and waits; nothing listens until the operator
+# presses Start.
+#
+# WHY THE SCRUB IS HERE AND NOT ONLY IN run.sh
+#
+# A terminal launched from the VS Code snap exports variables pointing into
+# /snap and $HOME/snap. LOCPATH kills processes outright, and XDG_DATA_HOME
+# shadows the system glib schemas so gsettings keys that exist appear missing.
+# A .desktop launch inherits the session environment, so an installed copy is
+# just as exposed as a developer's shell -- more so, because there is no
+# terminal to read the failure in.
+#
+# Scrub by RULE, not by a list of names: any variable whose VALUE points into a
+# snap tree. Two exceptions, both load-bearing:
+#   * PATH is left alone -- it needs no blanket removal.
+#   * XDG_DATA_DIRS is FILTERED, not dropped: it holds real system paths, and
+#     dropping it takes the desktop's own data directories with it.
+set -uo pipefail
+
+BIN=/usr/libexec/remotedexter/host_app
+[ -x "$BIN" ] || { echo "remotedexter: $BIN is missing or not executable" >&2; exit 1; }
+
+scrubbed=0
+while IFS= read -r name; do
+    case "$name" in PATH|XDG_DATA_DIRS) continue ;; esac
+    value="${!name-}"
+    case "$value" in
+        /snap/*|"$HOME"/snap/*|*:/snap/*|*:"$HOME"/snap/*)
+            unset "$name"; scrubbed=$((scrubbed + 1)) ;;
+    esac
+done < <(compgen -v)
+if [ -n "${XDG_DATA_DIRS:-}" ]; then
+    kept=""
+    IFS=':' read -ra parts <<< "$XDG_DATA_DIRS"
+    for p in "${parts[@]}"; do
+        case "$p" in
+            /snap/*|"$HOME"/snap/*|"") ;;
+            *) kept="${kept:+$kept:}$p" ;;
+        esac
+    done
+    export XDG_DATA_DIRS="$kept"
+fi
+
+# ── capabilities ────────────────────────────────────────────────────────
+#
+# THIS WAS MISSING UNTIL 2026-09-05 AND THE PACKAGED PRODUCT DID NOTHING.
+#
+# Capabilities are deny-by-default, and this launcher granted none — so a user
+# who installed the .deb and clicked the desktop icon got a host that could not
+# capture the screen. Not a degraded session: `stream_start` is refused, so the
+# phone shows nothing and the console explains nothing at that moment.
+#
+# It survived because `supported_launchers_grant_capture_but_not_input` reads
+# run.sh and windows/run.bat — the two DEVELOPMENT launchers — and never read
+# this file, the one that actually ships. The test proved its property about
+# the wrong artifact. Found by the operator clicking the icon instead of typing
+# run.sh, which is what every real user does.
+#
+# Viewing is granted because a remote-desktop host that cannot show a desktop
+# has no function. INPUT IS NOT, and must not be: deny-by-default is the policy
+# and a launcher does not get to overrule it. What the launcher owes the
+# operator is the way to grant it — the refusal otherwise arrives as a toast on
+# the phone naming an environment variable, on a machine they may not be
+# sitting at.
+export RD_CAP_SCREENSHOT=1
+
+echo "remotedexter: snap variables scrubbed: $scrubbed"
+echo "remotedexter: viewing enabled. Control is NOT — that is deliberate."
+echo "remotedexter:   to allow the phone to control this desktop, start it with:"
+echo "remotedexter:       RD_CAP_INPUT=1 remotedexter"
+echo "remotedexter:   clipboard is a separate grant: RD_CAP_CLIPBOARD=1"
+echo "remotedexter: opening the host console — nothing listens until you press Start."
+exec "$BIN" "$@"

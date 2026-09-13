@@ -1,0 +1,90 @@
+# RemoteDexter — Cargo workspace
+#
+# LICENCE: AGPL-3.0-only. Settled, and chosen deliberately rather than
+# inherited: RemoteDexter is independently implemented. See
+# docs/THIRD_PARTY_NOTICES.md for dependency attribution. Members declare it with
+# `license.workspace = true`; crates that are scheduled for deletion have not
+# been touched, so an undeclared licence here means "on the way out", not
+# "unlicensed".
+#
+# ONE TIER, as of Block 10. `members` and `default-members` are now the same
+# set, so `cargo test` and `cargo test --workspace` compile and run the same
+# thing.
+#
+# It used to be two. The second was the RDUP / agentic tier —
+# state_context_manager, agentic_orchestrator, model_loader and the
+# cognition_engine / intent_router crates they pulled in — and it DID NOT
+# COMPILE: 416 errors in rdx-model-loader's `multiplexer_real_integration`
+# test. Because cargo builds every test target before running any, that one
+# failure meant ZERO tests executed across the whole workspace, so the obvious
+# command gave a red wall and no counts. `scripts/gate.sh` carried a DEBT row
+# asserting the breakage stayed confined to exactly that crate.
+#
+# Block 10 deleted the tier outright (plan §4.1: all agentic/AI orchestration
+# is cut — it adds model supply chain, memory, intent and authority ambiguity
+# to software that already controls a machine). The DEBT row went with it.
+#
+[workspace]
+resolver = "2"
+members = [
+    "crates/pairing",
+    "crates/wire",
+    "crates/host_controller",
+    "crates/capture_windows",
+    "crates/session_core",
+    "crates/relay",
+    "crates/relay_proto",
+    "modules/connection_package_generator",
+    "modules/scp_consumer",
+    "modules/session_manager",
+    "modules/module6",
+    "modules/module10",
+    "modules/module11",
+    "modules/stream_chunk",
+    "modules/module13_transport",
+    "modules/module15_host_session",
+    "modules/module14_apk_session",
+    "rust",
+    "host_app",
+    "governor",
+    "sil",
+    # Future modules:
+    # "modules/signaling_layer",
+    # "modules/transport_ladder",
+    # "modules/noise_session",
+    # "modules/connection_maintenance",
+    # "modules/viewer_integration",
+    # "modules/ui_layer",
+]
+
+# Identical to `members` since Block 10. Kept explicit rather than deleted so
+# that adding a crate is a deliberate two-line act: a member that is silently
+# not a default-member is a crate whose tests never run.
+default-members = [
+    "crates/pairing",
+    "crates/wire",
+    "crates/host_controller",
+    "crates/capture_windows",
+    "crates/session_core",
+    "crates/relay",
+    "crates/relay_proto",
+    "modules/connection_package_generator",
+    "modules/scp_consumer",
+    "modules/session_manager",
+    "modules/module6",
+    "modules/module10",
+    "modules/module11",
+    "modules/stream_chunk",
+    "modules/module13_transport",
+    "modules/module15_host_session",
+    "modules/module14_apk_session",
+    "rust",
+    "host_app",
+    "governor",
+    "sil",
+]
+
+# Inherited by members that opt in with `license.workspace = true`.
+[workspace.package]
+license = "AGPL-3.0-only"
+edition = "2021"

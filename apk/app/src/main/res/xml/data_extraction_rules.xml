@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Nothing this app stores may leave the device by any extraction path.
+
+  WHY THIS FILE EXISTS. `android:allowBackup="false"` was already set, and the
+  code said so: RDService called it out as the reason the client's private
+  identity key was safe in `filesDir`. That reasoning covered CLOUD BACKUP only.
+  From Android 12 (API 31) device-to-device transfer is governed by THIS file,
+  and an app that does not supply one has all of its data included in a D2D
+  transfer regardless of `allowBackup`.
+
+  The consequence was specific, not theoretical. The client's X25519 private
+  identity lives as a plain file under `filesDir`, and the paired-host records
+  live in SharedPreferences. Transferring to a new phone would therefore have
+  CLONED AN ENROLLED IDENTITY onto a second device — one the host has never
+  seen a pairing for, yet would authenticate, because it presents the enrolled
+  key. Pairing is meant to name one device; a transfer would have made it name
+  two, silently, with no scan and no operator approval.
+
+  Every domain is listed rather than relying on `root` to cover the ones nested
+  inside it: this file is a security boundary, and "probably implied" is not the
+  standard it should be read at. `allowBackup="false"` stays in the manifest for
+  devices below API 31, which never consult this file.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="root" />
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+        <exclude domain="external" />
+        <exclude domain="device_root" />
+        <exclude domain="device_file" />
+        <exclude domain="device_database" />
+        <exclude domain="device_sharedpref" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="root" />
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+        <exclude domain="external" />
+        <exclude domain="device_root" />
+        <exclude domain="device_file" />
+        <exclude domain="device_database" />
+        <exclude domain="device_sharedpref" />
+    </device-transfer>
+</data-extraction-rules>

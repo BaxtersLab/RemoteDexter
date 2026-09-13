@@ -1,0 +1,24 @@
+Package: remotedexter
+Version: 3.0.13
+Section: net
+Priority: optional
+Architecture: amd64
+Maintainer: Baxter <baxtersbeats@outlook.com>
+Depends: libc6, libgcc-s1, libatomic1, libffi8, libglib2.0-0t64,
+ libgstreamer1.0-0, libgstreamer-plugins-base1.0-0, liborc-0.4-0t64,
+ libpcre2-8-0, libwayland-client0, libxkbcommon0,
+ gstreamer1.0-plugins-base, gstreamer1.0-pipewire,
+ xdg-desktop-portal, pipewire
+Recommends: xdg-desktop-portal-gnome | xdg-desktop-portal-gtk | xdg-desktop-portal-kde
+Description: Remote desktop host for Wayland, driven from an Android phone
+ RemoteDexter shares this machine's desktop with a paired Android device over a
+ Noise XX channel with the host's identity key pinned client-side. Capture is
+ Wayland-native through xdg-desktop-portal and PipeWire; input injection uses
+ the kernel's uinput virtual device, which no other display protocol on Wayland
+ can provide.
+ .
+ Installing this package starts nothing and listens on nothing. There is no
+ service, no autostart, no open port and no key until the host is launched and
+ the operator presses Start. Input injection needs /dev/uinput, and the grant
+ for it is a separate, explicit, reversible action taken from the host UI -- the
+ packaged udev rule ships as inert data and is never installed by the package.

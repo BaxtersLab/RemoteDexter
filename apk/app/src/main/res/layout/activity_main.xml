@@ -1,0 +1,138 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The remote desktop is the screen. A SurfaceView, not an ImageView: frames are
+  drawn straight onto the surface by SurfaceFramePipeline on its own render
+  thread, with an fps cap and a reusable bitmap, rather than round-tripping
+  through the view hierarchy on the main thread.
+
+  The pipeline letterboxes with its own fitCenter(), so the host's aspect ratio
+  is preserved without the view scaling anything. Controls sit below the surface
+  rather than over it, so nothing covers the picture.
+
+    Setup/utility controls stay compact. Session safety controls do not: Enable
+    Control and Disconnect have a dedicated 48dp row so they remain dependable
+    finger targets on the physical SM-G970U.
+-->
+<!--
+  RelativeLayout, not a weighted LinearLayout, and the reason is measured.
+
+  The controls were a wrap_content block below a SurfaceView with weight="1".
+  On the SM-G970U the block measured about 600px and the root handed the
+  surface 110px more than was left, so the last row was drawn past the window
+  bottom: the control row reported 144px tall and was clipped to 40. That
+  predates the scroll buttons — the ORIGINAL control row ran off the window too,
+  and nobody noticed because a button 100px short still looks like a button.
+  Only when a row was added BELOW it did the loss become visible.
+
+  Anchoring the panel to the bottom removes the arithmetic entirely: the panel
+  gets its natural height because nothing competes for it, and the surface takes
+  what is between the status line and the panel, by construction rather than by
+  a weight that has to come out right.
+-->
+<RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <!-- Block 5: the app's actual state, always visible. Refusals used to be
+         Log.w and nothing else, so a refusal was indistinguishable from a bug. -->
+    <TextView
+        android:id="@+id/txtSessionState"
+        android:layout_alignParentTop="true"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:padding="12dp"
+        android:textStyle="bold"
+        android:text="@string/state_idle" />
+
+    <!--
+      Anchored to the bottom; everything else is measured around it.
+
+      WRAPPED, because RelativeLayout rules do not survive an <include> tag.
+      Measured on the SM-G970U: with layout_alignParentBottom on the include
+      itself, the panel was positioned immediately after the surface instead of
+      at the parent bottom, so it still ran off the window and the scroll row
+      was clipped to 34px. The width, height and id were honoured; the
+      positioning rule was not. The wrapper carries the rule, the include
+      carries the content.
+    -->
+    <FrameLayout
+        android:id="@+id/controlsPanel"
+        android:layout_alignParentBottom="true"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content">
+
+        <include layout="@layout/controls_panel"/>
+    </FrameLayout>
+
+    <!--
+      The compose bar: where typing is composed before it is sent.
+
+      It was a 1dp invisible field that cleared itself after every character,
+      forwarding each keystroke live. The operator's verdict: "its a blind
+      send" — nothing to read, and no chance to fix a typo before it landed in
+      a remote shell. Live per-keystroke typing is right on a low-latency link;
+      over a phone on congested Wi-Fi it means committing characters to a
+      machine you cannot read clearly.
+
+      Hidden until Keys is pressed, so it costs no picture when unused.
+
+      inputType is text|textNoSuggestions. It was textVisiblePassword, chosen
+      to suppress autocorrect — which also SUPPRESSED THE MICROPHONE, because
+      Android hides voice input on password fields. Dictation is exactly what a
+      phone is good at, so that trade was backwards.
+
+      Single line with imeOptions=actionGo, not textMultiLine: Enter must COMMIT
+      the line rather than insert a newline into it, which is what makes the
+      key mean the same thing here as it does at a shell prompt.
+
+      flagNoExtractUi stops the IME replacing the screen with a full-screen
+      editor in landscape — which is how this device is held, and it would hide
+      the desktop being typed into.
+    -->
+    <LinearLayout
+        android:id="@+id/composeRow"
+        android:layout_above="@id/controlsPanel"
+        android:orientation="horizontal"
+        android:visibility="gone"
+        android:gravity="center_vertical"
+        android:paddingStart="4dp"
+        android:paddingEnd="4dp"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content">
+
+        <EditText
+            android:id="@+id/keyboardSink"
+            android:layout_width="0dp"
+            android:layout_weight="1"
+            android:layout_height="wrap_content"
+            android:minHeight="48dp"
+            android:textSize="15sp"
+            android:maxLines="1"
+            android:hint="@string/compose_hint"
+            android:importantForAutofill="no"
+            android:inputType="text|textNoSuggestions"
+            android:imeOptions="actionGo|flagNoExtractUi"
+            android:contentDescription="@string/keyboard_field_description"/>
+
+        <Button
+            android:id="@+id/btnSendText"
+            android:text="@string/send"
+            android:textSize="13sp"
+            android:minHeight="48dp"
+            android:minWidth="0dp"
+            android:paddingStart="10dp"
+            android:paddingEnd="10dp"
+            android:layout_width="wrap_content"
+            android:layout_height="48dp"
+            android:layout_marginStart="4dp"/>
+    </LinearLayout>
+
+    <SurfaceView
+        android:id="@+id/desktopSurface"
+        android:layout_below="@id/txtSessionState"
+        android:layout_above="@id/composeRow"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:contentDescription="@string/desktop_view_description"/>
+</RelativeLayout>

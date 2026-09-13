@@ -1,0 +1,22 @@
+[package]
+name = "relay_proto"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+description = "The relay's control-frame grammar: the entire surface a stranger reaches by connecting, and the only part of the relay the host needs."
+
+# WHY THIS IS ITS OWN CRATE. The host has to speak this grammar to dial out, and
+# `relay` is the relay SERVER -- its session table, its host authentication, its
+# splice. Depending on the whole thing would put the server's code inside the
+# client of that server. Duplicating the grammar instead would be worse: a wire
+# contract with two definitions diverges, and the divergence is silent.
+#
+# Nothing here decides anything. It parses and it bounds, and both halves depend
+# on it rather than on each other.
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[lib]
+name = "relay_proto"
+path = "src/lib.rs"

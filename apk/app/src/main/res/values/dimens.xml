@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      The control panel's height, stated once.
+
+      Every row in controls_panel.xml is a fixed height, so this is arithmetic
+      and not a guess: 48dp icon row + 4dp padding, 44dp chord row, 48dp control
+      row + 4dp, 48dp scroll row + 4dp = 200dp.
+
+      It is stated rather than left to wrap_content because wrap_content did not
+      hold. Measured on the SM-G970U: the rows need 600px and the panel was
+      given 490, so the bottom row was drawn past the window edge and clipped to
+      40px — first the control row, unnoticed for weeks because a short button
+      still looks like a button, and then the scroll buttons, which is what made
+      it visible. Two root layouts were tried, LinearLayout with a weight and
+      RelativeLayout with the panel anchored to the bottom, and both produced
+      the same 490.
+
+      If a row's height changes, change this with it. ControlRowFitTest and the
+      instrumentation layout tests are what catch it if that is forgotten.
+    -->
+    <dimen name="controls_panel_height">200dp</dimen>
+
+    <!--
+      How wide the control column is when the phone is held sideways.
+
+      200dp. It was 340dp, which is what ENABLE + CONNECT + DISCONNECT +
+      Settings measure on one line — and a column can be no narrower than its
+      widest row. The operator's verdict on that: *"when i turn it sideways the
+      button pannel takes 50% of the screen (entire right side)"*.
+
+      `reflowPanel` gives the two crowded rows a second line in landscape, which
+      is what lets this be 200dp: about 28% of the screen rather than half, and
+      no label is clipped to get it.
+    -->
+    <dimen name="controls_panel_width">200dp</dimen>
+</resources>
