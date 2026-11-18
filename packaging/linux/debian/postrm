@@ -8,8 +8,8 @@
 #
 # WHY THE EXPECTED CONTENT IS DUPLICATED HERE
 # On purge, dpkg has already removed the package's files, so
-# /usr/share/remotedexter/70-remotedexter-uinput.rules is gone and
-# /usr/libexec/remotedexter/remotedexter-enable-input cannot be called to do
+# /opt/baxters/remotedexter/70-remotedexter-uinput.rules is gone and
+# /opt/baxters/remotedexter/remotedexter-enable-input cannot be called to do
 # this. The expected bytes therefore have to live inside this script. A unit
 # test (host_app input_grant::tests::postrm_expects_the_packaged_rule_byte_for_byte)
 # asserts this copy is byte-identical to the packaged rule, so the two cannot

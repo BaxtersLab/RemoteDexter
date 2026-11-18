@@ -103,7 +103,7 @@ class ScanFailureReportTest {
      */
     @Test
     fun a_scanned_download_url_is_still_echoed_because_it_holds_no_secret() {
-        val url = "https://baxters.vip/remotedexter/"
+        val url = "https://github.com/BaxtersLab/RemoteDexter"
         val lines = ScanFailureReport.describe(url, JSONException("not a JSON object"))
             .joinToString("\n")
         assertTrue("the diagnostic must survive: $lines", lines.contains(url))
@@ -147,6 +147,6 @@ class ScanFailureReportTest {
         assertTrue(ScanFailureReport.mayCarrySecret("""{"SESSION_TOKEN":"abc"""))
         assertTrue(ScanFailureReport.mayCarrySecret("""{"signature":"abc"""))
         assertTrue(ScanFailureReport.mayCarrySecret("""{"host_pubkey":"abc"""))
-        assertFalse(ScanFailureReport.mayCarrySecret("https://baxters.vip/remotedexter/"))
+        assertFalse(ScanFailureReport.mayCarrySecret("https://github.com/BaxtersLab/RemoteDexter"))
     }
 }

@@ -222,6 +222,91 @@ class KeyboardUiTest {
         }
     }
 
+    /**
+     * RD-TEXT-1. The host refuses a paragraph it cannot type — here an accented
+     * letter — with an `error` for `input_event`. That is an answer about the
+     * TEXT; the host still holds the grant. The phone treated it as losing
+     * control and switched to Viewing Only, so the operator's next tap went
+     * nowhere.
+     */
+    @Test
+    fun aTextRefusalDoesNotTurnControlOff() {
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            scenario.onActivity { InputController.onAck("grant_input") }
+            InstrumentationRegistry.getInstrumentation().waitForIdleSync()
+            scenario.onActivity {
+                InputController.onDenied("input_event", "unsupported_character")
+            }
+            InstrumentationRegistry.getInstrumentation().waitForIdleSync()
+            assertTrue(
+                "a refusal of the TEXT switched the phone to Viewing Only",
+                InputController.isControlEnabled()
+            )
+        }
+    }
+
+    /**
+     * RD-TEXT-1. Composing exists so the operator can read what they are about
+     * to send. A paragraph in a one-line field scrolls sideways out of sight,
+     * so it must wrap — while staying a single-line INPUT, so the keyboard's
+     * action key is still Go and not a newline.
+     */
+    @Test
+    fun aParagraphWrapsInTheComposeFieldAndGoStaysGo() {
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            scenario.onActivity { InputController.onAck("grant_input") }
+            InstrumentationRegistry.getInstrumentation().waitForIdleSync()
+            scenario.onActivity { activity ->
+                activity.findViewById<android.widget.ImageButton>(R.id.btnKeyboard).performClick()
+            }
+            InstrumentationRegistry.getInstrumentation().waitForIdleSync()
+            scenario.onActivity { activity ->
+                activity.findViewById<EditText>(R.id.keyboardSink)
+                    .setText("Several sentences of a paragraph, long enough to wrap. ".repeat(8))
+            }
+            InstrumentationRegistry.getInstrumentation().waitForIdleSync()
+            scenario.onActivity { activity ->
+                val sink = activity.findViewById<EditText>(R.id.keyboardSink)
+                assertTrue(
+                    "a paragraph sits on ${sink.lineCount} line(s); it must wrap to be readable",
+                    sink.lineCount > 1
+                )
+                assertEquals(
+                    "the keyboard's action key must still be Go",
+                    android.view.inputmethod.EditorInfo.IME_ACTION_GO,
+                    sink.imeOptions and android.view.inputmethod.EditorInfo.IME_MASK_ACTION
+                )
+                assertFalse(
+                    "a multi-line input type turns Go into a newline",
+                    sink.inputType and InputType.TYPE_TEXT_FLAG_MULTI_LINE != 0
+                )
+            }
+        }
+    }
+
+    /**
+     * RD-TEXT-1. Text the host hands back goes into the field IN FRONT of
+     * anything typed since — it came first — with the cursor at the end, so
+     * the operator can fix it and send again.
+     */
+    @Test
+    fun aReturnedParagraphGoesBackInFrontOfNewText() {
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            scenario.onActivity { activity ->
+                activity.findViewById<EditText>(R.id.keyboardSink).setText(" and more")
+                val back = PendingTexts.Returned("Café notes", 0, 10, "é")
+                assertNotNull("the activity is not listening for returned text", InputController.onTextReturned)
+                InputController.onTextReturned!!.invoke("unsupported_character", back, null)
+            }
+            InstrumentationRegistry.getInstrumentation().waitForIdleSync()
+            scenario.onActivity { activity ->
+                val sink = activity.findViewById<EditText>(R.id.keyboardSink)
+                assertEquals("Café notes and more", sink.text.toString())
+                assertEquals(sink.text.length, sink.selectionEnd)
+            }
+        }
+    }
+
     @Test
     fun theKeysButtonIsDisabledWhileIdle() {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->

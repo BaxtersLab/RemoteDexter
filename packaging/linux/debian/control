@@ -1,5 +1,5 @@
-Package: remotedexter
-Version: 3.0.13
+Package: baxters-remotedexter
+Version: 3.1.0.1-1
 Section: net
 Priority: optional
 Architecture: amd64
@@ -10,6 +10,9 @@ Depends: libc6, libgcc-s1, libatomic1, libffi8, libglib2.0-0t64,
  gstreamer1.0-plugins-base, gstreamer1.0-pipewire,
  xdg-desktop-portal, pipewire
 Recommends: xdg-desktop-portal-gnome | xdg-desktop-portal-gtk | xdg-desktop-portal-kde
+Conflicts: remotedexter (<< 3.1.0~)
+Replaces: remotedexter (<< 3.1.0~)
+Provides: remotedexter
 Description: Remote desktop host for Wayland, driven from an Android phone
  RemoteDexter shares this machine's desktop with a paired Android device over a
  Noise XX channel with the host's identity key pinned client-side. Capture is
@@ -22,3 +25,6 @@ Description: Remote desktop host for Wayland, driven from an Android phone
  the operator presses Start. Input injection needs /dev/uinput, and the grant
  for it is a separate, explicit, reversible action taken from the host UI -- the
  packaged udev rule ships as inert data and is never installed by the package.
+ .
+ This package replaces the standalone "remotedexter" package of the 3.0 series;
+ installing it removes that package and takes over its command.

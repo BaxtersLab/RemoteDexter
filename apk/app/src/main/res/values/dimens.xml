@@ -16,10 +16,15 @@
       RelativeLayout with the panel anchored to the bottom, and both produced
       the same 490.
 
-      If a row's height changes, change this with it. ControlRowFitTest and the
-      instrumentation layout tests are what catch it if that is forgotten.
+      2026-09-18: THE ARITHMETIC ABOVE WAS SHORT. It never counted the chord
+      row's padding: on a 440dpi screen the rows need 557px and 200dp is 550, so
+      the last row — the scroll pair, the operator's only way to scroll — was
+      clipped first, and the operator reported it missing. Upright, the panel is
+      now re-measured after every layout (MainActivity.fitPortraitPanel), so this
+      figure is only the first frame's estimate; ScrollPairOnScreenTest asserts
+      the pair is whole, upright and sideways, and when a row above it grows.
     -->
-    <dimen name="controls_panel_height">200dp</dimen>
+    <dimen name="controls_panel_height">204dp</dimen>
 
     <!--
       How wide the control column is when the phone is held sideways.

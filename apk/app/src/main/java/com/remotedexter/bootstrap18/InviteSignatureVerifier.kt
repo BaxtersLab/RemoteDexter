@@ -63,6 +63,49 @@ object InviteSignatureVerifier {
      * invite verified under v4's encoding would be a downgrade, and the version
      * is inside the signed bytes precisely so that cannot happen quietly.
      */
+    /**
+     * The v6 counterpart of [isValidV5]: both routes, one signature, verified
+     * only under v6's own encoding. Signature validity, never trust — trust is
+     * still [InviteTrustPolicy]'s job, and both checks are required.
+     */
+    fun isValidV6(invite: InviteV6): Boolean =
+        isValidFor(
+            invite.signature,
+            invite.hostIdentityPubkey,
+            invite.version == InviteDecoder.DUAL_INVITE_VERSION
+        ) { InviteDecoder.canonicalBytesV6(invite) }
+
+    /**
+     * The shared, fail-closed body: a blank or wrong-sized key or signature, a
+     * version the caller did not expect, or any decoding error is `false`.
+     * The canonical bytes are computed only once those checks pass.
+     */
+    private fun isValidFor(
+        signature: String,
+        identity: String,
+        versionMatches: Boolean,
+        canonical: () -> ByteArray
+    ): Boolean {
+        if (signature.isBlank() || identity.isBlank() || !versionMatches) return false
+        return try {
+            val publicKeyBytes = Base64.getDecoder().decode(identity)
+            val signatureBytes = Base64.getDecoder().decode(signature)
+            if (publicKeyBytes.size != ED25519_PUBLIC_KEY_BYTES ||
+                signatureBytes.size != ED25519_SIGNATURE_BYTES
+            ) {
+                return false
+            }
+            val message = canonical()
+            val verifier = Ed25519Signer().apply {
+                init(false, Ed25519PublicKeyParameters(publicKeyBytes, 0))
+                update(message, 0, message.size)
+            }
+            verifier.verifySignature(signatureBytes)
+        } catch (e: Exception) {
+            false
+        }
+    }
+
     fun isValidV5(invite: InviteV5): Boolean {
         if (invite.signature.isBlank() || invite.hostIdentityPubkey.isBlank()) {
             return false

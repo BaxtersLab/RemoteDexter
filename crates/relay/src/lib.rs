@@ -62,6 +62,7 @@
 //! above.
 
 pub mod auth;
+pub mod logline;
 pub mod server;
 pub mod session;
 
@@ -72,9 +73,10 @@ pub use relay_proto as frame;
 pub use auth::{HostAuth, HostAuthError, HostIdentity};
 pub use frame::{ControlFrame, FrameError, MAX_CONTROL_FRAME};
 pub use server::{
-    accept_data, accept_data_with, attach_control, confirm_join, heartbeat, join_client,
-    join_client_with, mint_attach, notify_host, register_host, register_host_with, release,
-    serve_connection, splice, touch_session, vacate_session, AttachWaiter, DataAttachment, Relay,
-    ServeError,
+    accept_data, accept_data_with, attach_control, bound_splice_socket, confirm_join, heartbeat,
+    join_client, join_client_with, mint_attach, notify_host, register_host, register_host_with,
+    release, release_if_current, serve_connection, serve_connection_admitted, splice,
+    splice_within, touch_session, vacate_session, AttachWaiter, ControlGeneration, DataAttachment,
+    Relay, ServeError, SpliceEnd, SpliceReport, SPLICE_BACKLOG_BOUND, SPLICE_STALL,
 };
-pub use session::{AttachTable, SessionId, SessionTable, TableError, Ticket};
+pub use session::{AttachTable, SessionId, SessionKey, SessionTable, TableError, Ticket};

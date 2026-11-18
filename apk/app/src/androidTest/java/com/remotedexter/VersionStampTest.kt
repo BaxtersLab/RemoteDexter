@@ -62,6 +62,11 @@ class VersionStampTest {
     /**
      * And the release number itself must have moved past the versions that are
      * already out there under other content.
+     *
+     * The published 3.0.13 carries versionCode 14 (13 was already taken by
+     * three days of separate work). Android refuses to install over an app with
+     * a versionCode that is not lower, so a release that must replace 3.0.13 on
+     * a phone has to be past 14.
      */
     @Test
     fun theReleaseNumberIsPastTheOnesAlreadyPublished() {
@@ -69,9 +74,9 @@ class VersionStampTest {
         @Suppress("DEPRECATION")
         val code = ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionCode
         assertTrue(
-            "versionCode $code is not past 13, which three days of separate work " +
-                "already shipped under",
-            code >= 14
+            "versionCode $code is not past 14, the published 3.0.13's; a phone " +
+                "running 3.0.13 would refuse this build as a downgrade",
+            code >= 15
         )
     }
 }

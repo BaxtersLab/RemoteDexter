@@ -71,7 +71,7 @@ object DesktopCoordinateMapper {
                 panX.isFinite() && panY.isFinite()
     }
 
-    /** A point in host desktop pixels. Always inside the frame when returned. */
+    /** A point in the coordinate space requested by the mapping function. */
     data class DesktopPoint(val x: Int, val y: Int)
 
     /**
@@ -135,24 +135,42 @@ object DesktopCoordinateMapper {
         touchY: Float,
         offsetPx: Float
     ): DesktopPoint? {
+        val (u, v) = touchFractions(g, touchX, touchY, offsetPx) ?: return null
+        return DesktopPoint(
+            x = (u * g.frameWidth).roundToInt().coerceIn(0, g.frameWidth - 1),
+            y = (v * g.frameHeight).roundToInt().coerceIn(0, g.frameHeight - 1)
+        )
+    }
+
+    /** Resolution-independent coordinates, sent only after the host acknowledges normalized_v1. */
+    fun mapTouchToNormalized(
+        g: RenderGeometry,
+        touchX: Float,
+        touchY: Float,
+        offsetPx: Float
+    ): DesktopPoint? {
+        val (u, v) = touchFractions(g, touchX, touchY, offsetPx) ?: return null
+        return DesktopPoint(
+            x = (u * 65535).roundToInt(),
+            y = (v * 65535).roundToInt()
+        )
+    }
+
+    private fun touchFractions(
+        g: RenderGeometry,
+        touchX: Float,
+        touchY: Float,
+        offsetPx: Float
+    ): Pair<Float, Float>? {
         if (!touchX.isFinite() || !touchY.isFinite()) return null
         if (!offsetPx.isFinite() || offsetPx < 0f) return null
         val rect = destinationRect(g) ?: return null
 
         val targetY = touchY - offsetPx
-
-        // Normalised position across the drawn rectangle, then into frame pixels.
         val u = (touchX - rect.left) / rect.width
         val v = (targetY - rect.top) / rect.height
         if (!u.isFinite() || !v.isFinite()) return null
-
-        val px = (u * g.frameWidth).roundToInt()
-        val py = (v * g.frameHeight).roundToInt()
-
-        return DesktopPoint(
-            x = px.coerceIn(0, g.frameWidth - 1),
-            y = py.coerceIn(0, g.frameHeight - 1)
-        )
+        return u.coerceIn(0f, 1f) to v.coerceIn(0f, 1f)
     }
 
     /**

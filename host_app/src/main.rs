@@ -44,9 +44,13 @@ mod capture_status;
 mod clipboard;
 mod device_file;
 mod identity_store;
+mod input_coordinates;
 mod input_grant;
 mod relay_dial;
+mod session_writer;
+mod settings;
 mod share_source;
+mod single_instance;
 mod stream_backpressure;
 mod stream_ladder;
 mod ui;
@@ -265,6 +269,7 @@ impl RdBackend {
 pub(crate) enum Minted {
     Direct(pairing::Invitation),
     Relay(pairing::RelayInvitation),
+    Dual(pairing::DualInvitation),
 }
 
 impl Minted {
@@ -272,6 +277,7 @@ impl Minted {
         match self {
             Minted::Direct(i) => &i.token_fingerprint,
             Minted::Relay(i) => &i.token_fingerprint,
+            Minted::Dual(i) => &i.token_fingerprint,
         }
     }
 
@@ -279,6 +285,7 @@ impl Minted {
         match self {
             Minted::Direct(i) => i.invite.expires_at,
             Minted::Relay(i) => i.invite.expires_at,
+            Minted::Dual(i) => i.invite.expires_at,
         }
     }
 
@@ -287,40 +294,71 @@ impl Minted {
         match self {
             Minted::Direct(i) => format!("{}:{}", i.invite.addr, i.invite.port),
             Minted::Relay(i) => format!("relay {}:{}", i.invite.relay_addr, i.invite.relay_port),
+            Minted::Dual(i) => format!(
+                "{}:{} and relay {}:{}",
+                i.invite.addr, i.invite.port, i.invite.relay_addr, i.invite.relay_port
+            ),
+        }
+    }
+
+    /// Which routes this code names, in words for the window.
+    pub(crate) fn carries(&self) -> &'static str {
+        match self {
+            Minted::Direct(_) => "the LAN route",
+            Minted::Relay(_) => "the relay route",
+            Minted::Dual(_) => "both routes",
         }
     }
 
     pub(crate) fn into_view(self) -> host_controller::state::InviteView {
+        let carries = self.carries().to_string();
         let (qr, token_fingerprint, expires_at) = match self {
             Minted::Direct(i) => (i.qr, i.token_fingerprint, i.invite.expires_at),
             Minted::Relay(i) => (i.qr, i.token_fingerprint, i.invite.expires_at),
+            Minted::Dual(i) => (i.qr, i.token_fingerprint, i.invite.expires_at),
         };
         host_controller::state::InviteView {
             qr_size: qr.size,
             qr_modules: qr.modules,
             token_fingerprint,
             expires_at,
+            carries,
         }
     }
 }
 
-/// Mint the invite the host's ACTUAL route calls for.
+/// Mint the invite the host's ACTUAL routes call for.
 ///
-/// The two schemas name different things — v4 an address and a port, v5 a relay
-/// and the session it issued — so neither is derived from the other and neither
-/// is a fallback for the other. A host that is reachable one way must not be
-/// able to advertise itself the other.
+/// The schemas name different things — v4 an address and a port, v5 a relay and
+/// the session it issued, v6 both — so none is derived from another and none is
+/// a fallback for another. A host must not advertise a route it is not on.
+///
+/// `dual_route_codes` is the operator's "Pairing codes carry both routes"
+/// setting. It matters only when the host is serving BOTH routes: a host with
+/// one route still mints v4 or v5, which every app reads.
 pub(crate) fn mint_for(
     pairing: &mut pairing::PairingService,
     reach: &host_controller::Reach,
     now: u64,
     caps: &[String],
+    dual_route_codes: bool,
 ) -> Result<Minted, pairing::MintError> {
     match reach {
         host_controller::Reach::Bound(bound) => {
             pairing.create_invite(*bound, now, caps).map(Minted::Direct)
         }
-        host_controller::Reach::ViaRelay { relay, session } => pairing
+        host_controller::Reach::Both {
+            bound,
+            relay,
+            session,
+        } if dual_route_codes => pairing
+            .create_dual_invite(*bound, *relay, session, now, caps)
+            .map(Minted::Dual),
+        // A host serving both routes WITHOUT the operator's opt-in mints the
+        // relay code: it is the default route and every app can read it
+        // (design addendum §11).
+        host_controller::Reach::ViaRelay { relay, session }
+        | host_controller::Reach::Both { relay, session, .. } => pairing
             .create_relay_invite(*relay, session, now, caps)
             .map(Minted::Relay),
     }
@@ -374,7 +412,10 @@ impl host_controller::HostBackend for RdBackend {
             caps.push(pairing::CAP_CONTROL.to_string());
         }
 
-        let minted = mint_for(&mut self.pairing, reach, now, &caps)
+        // Read at mint time, not at start: the operator can change it while
+        // the host runs, and the next code should follow it.
+        let dual = crate::settings::current().pairing.dual_route_codes;
+        let minted = mint_for(&mut self.pairing, reach, now, &caps, dual)
             .map_err(|e| host_controller::BackendFault::new(e.reason()))?;
 
         // The token is never logged. The fingerprint is a hash prefix, and the
@@ -443,9 +484,46 @@ impl host_controller::HostBackend for RdBackend {
     }
 }
 
+/// Exit status when another host already owns this user's data directory.
+///
+/// Distinct from `FAILURE` so a launcher or test script can tell "refused
+/// because a host is running" apart from "crashed".
+const EXIT_ALREADY_RUNNING: u8 = 3;
+
 fn main() -> Result<ExitCode> {
     eprintln!("[host_app] RemoteDexter — host console starting");
     warn_about_malformed_capability_vars();
+
+    // ONE HOST PER DATA DIRECTORY, taken before anything reads or writes the
+    // identity or the device list. This is a data-integrity guard, not a
+    // cosmetic one — see `single_instance`.
+    //
+    // BOUND TO A NAME ON PURPOSE. `let _ = ...` drops the value at once, which
+    // would release the lock the instant it was taken and silently disable the
+    // guard. `_instance` lives until `main` returns, and the operating system
+    // releases it if the process dies any other way.
+    let _instance = match single_instance::acquire(&single_instance::lock_path()) {
+        Ok(single_instance::Acquire::Acquired(lock)) => lock,
+        Ok(single_instance::Acquire::AlreadyRunning) => {
+            eprintln!(
+                "[host_app] RemoteDexter is already running for this user — not starting a second host."
+            );
+            eprintln!(
+                "[host_app] Two hosts would share one identity and one device list, and either could silently undo the other's changes."
+            );
+            eprintln!("[host_app] Switch to the RemoteDexter window that is already open.");
+            // stderr is invisible from the application menu; say it where they look.
+            single_instance::notify_already_running();
+            return Ok(ExitCode::from(EXIT_ALREADY_RUNNING));
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "could not lock the host data directory ({}): {e}. Startup stopped deliberately: \
+                 a host that cannot lock its data directory cannot keep its identity safe either.",
+                single_instance::lock_path().display()
+            ));
+        }
+    };
 
     let e2e_loopback = ui::e2e_loopback_bind(std::env::var("RD_E2E_LOOPBACK").ok().as_deref())
         .map_err(anyhow::Error::msg)?;
@@ -454,6 +532,41 @@ fn main() -> Result<ExitCode> {
     // key is a plain startup error rather than a mystery inside the GUI. They
     // are read here and never displayed: only the PUBLIC fingerprint reaches a
     // widget.
+    // What the host remembers between runs. Read AFTER the instance lock, so two
+    // hosts cannot race the same file, and BEFORE anything acts on a setting.
+    // A file that cannot be read leaves the host on deny-by-default defaults and
+    // is never rewritten — `settings::load_from` says so and so does this line.
+    let settings_path = settings::path();
+    let stored = settings::load_from(&settings_path);
+    eprintln!("[host_app] {}", stored.summary(&settings_path));
+    // What the session loop's capability checks read from here on.
+    settings::set_active(stored.settings.clone());
+    for cap in settings::Capability::ALL {
+        if settings::granted(cap) {
+            eprintln!(
+                "[host_app] {}",
+                settings::grant_view(cap, &stored.settings, false).headline
+            );
+        }
+    }
+    for over in settings::overrides(&stored.settings, |k| std::env::var(k).ok()) {
+        eprintln!(
+            "[host_app] {} in the environment overrides the stored settings for this run: {}",
+            over.variable, over.what
+        );
+    }
+    // Which relay this run would use, said before anything dials one. A host
+    // that is about to hold an outbound connection to someone else's server
+    // whenever it runs should say so where the operator can see it, whether
+    // they launched it from a terminal or from the icon.
+    eprintln!(
+        "[host_app] {}",
+        relay_dial::plan(&stored.settings.relay, |k| std::env::var(k).ok()).summary()
+    );
+    if stored.settings.relay.dial_on_start {
+        eprintln!("[host_app] Connecting through the relay on start, as remembered.");
+    }
+
     let identity = load_or_create_identity()?;
     let fingerprint = to_hex(&identity.public);
     eprintln!("[host_app] Host identity (pinned) pubkey: {fingerprint}");
@@ -518,6 +631,8 @@ fn main() -> Result<ExitCode> {
         fingerprint,
         e2e_loopback,
         devices,
+        settings_path,
+        stored.settings,
     ) {
         eprintln!("[host_app] host console failed: {e}");
         return Ok(ExitCode::FAILURE);
@@ -754,7 +869,17 @@ async fn handle_client_connection(
     // the Noise transport (single-owner nonce ordering), the write half,
     // and the outbound screen-stream chunks. `select!` interleaves
     // command handling with streamed frames.
-    let (mut rd, mut wr) = socket.into_split();
+    // Nagle off and the kernel's unsent bytes bounded, BEFORE the split, while
+    // the socket is still whole. A failure costs latency, not safety, so it is
+    // said and the session carries on.
+    if let Err(e) = session_writer::tune(&socket) {
+        eprintln!("[host] could not tune the session socket: {e}");
+    }
+    let (mut rd, wr) = socket.into_split();
+    // Every write happens in the writer task, never in this loop. See
+    // `session_writer` for the 2026-09-13 stall that made this necessary.
+    let (writer, mut writer_task) = session_writer::SessionWriter::spawn(wr);
+    let mut pending_chunk: Option<Vec<u8>> = None;
     let (ct_tx, mut ct_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     let reader = tokio::spawn(async move {
         loop {
@@ -846,7 +971,10 @@ async fn handle_client_connection(
                             denial.into_bytes(),
                         ) {
                             let ct_len = noise.write_message(&env.encode(), &mut buf)?;
-                            let _ = write_framed(&mut wr, &buf[..ct_len]).await;
+                            if let Err(why) = writer.queue_reply(&buf[..ct_len]) {
+                                eprintln!("[host] closing the session: {why:?}");
+                                break;
+                            }
                         }
                         continue;
                     }
@@ -857,7 +985,10 @@ async fn handle_client_connection(
                         // Liveness. Answered in kind and nothing else.
                         if let Ok(pong) = wire::Envelope::new(wire::Kind::Ping, 0, Vec::new()) {
                             let ct_len = noise.write_message(&pong.encode(), &mut buf)?;
-                            let _ = write_framed(&mut wr, &buf[..ct_len]).await;
+                            if let Err(why) = writer.queue_reply(&buf[..ct_len]) {
+                                eprintln!("[host] closing the session: {why:?}");
+                                break;
+                            }
                         }
                         continue;
                     }
@@ -934,21 +1065,25 @@ async fn handle_client_connection(
                     match cmd_type.as_str() {
                         "stream_start" => {
                             match frame_gate(&session, "stream_start", &cmd_val, now_secs) {
-                                Ok(w) => {
-                                    // A controller whose capture thread
-                                    // already exited (error or clean stop)
-                                    // must not block a fresh one — `Some`
-                                    // alone does not mean "still running".
-                                    if stream.as_ref().is_none_or(StreamController::is_finished)
-                                    {
-                                        stream = Some(StreamController::start(
-                                            75,
-                                            chunk_tx.clone(),
-                                            w,
-                                        ));
+                                Ok(w) => match stream_start_coordinates(&cmd_val, stream.as_ref(), w) {
+                                    Err(reason) => Some(json_err("stream_start", reason)),
+                                    Ok(coordinates) => {
+                                        // A controller whose capture thread
+                                        // already exited (error or clean stop)
+                                        // must not block a fresh one — `Some`
+                                        // alone does not mean "still running".
+                                        if stream.as_ref().is_none_or(StreamController::is_finished)
+                                        {
+                                            stream = Some(StreamController::start(
+                                                75,
+                                                chunk_tx.clone(),
+                                                w,
+                                                coordinates,
+                                            ));
+                                        }
+                                        Some(coordinates.stream_ack())
                                     }
-                                    Some(json_ack("stream_start"))
-                                }
+                                },
                                 Err(resp) => Some(resp),
                             }
                         }
@@ -960,7 +1095,11 @@ async fn handle_client_connection(
                             handle_screenshot_scoped(&session, &cmd_val, now_secs).await
                         }
                         "input_event" => {
-                            handle_input_scoped(&mut session, &cmd_val, now_secs)
+                            // Awaited: a text run yields between batches. The
+                            // loop takes no other command until it finishes,
+                            // which is what keeps a click sent after a
+                            // paragraph landing after it.
+                            handle_input_scoped(&mut session, &cmd_val, now_secs).await
                         }
                         _ => dispatch_agent2_command(&json_str).await,
                     }
@@ -974,13 +1113,23 @@ async fn handle_client_connection(
                     match wire::Envelope::new(wire::Kind::ControlJson, 0, resp.into_bytes()) {
                         Ok(env) => {
                             let ct_len = noise.write_message(&env.encode(), &mut buf)?;
-                            write_framed(&mut wr, &buf[..ct_len]).await?;
+                            if let Err(why) = writer.queue_reply(&buf[..ct_len]) {
+                                eprintln!("[host] closing the session: {why:?}");
+                                break;
+                            }
                         }
                         Err(e) => eprintln!("[host] cannot envelope a response: {e:?}"),
                     }
                 }
             }
-            Some(chunk) = chunk_rx.recv() => {
+            // A chunk is taken only when none is waiting for a slot, so while the
+            // link is slow the stream's own queue fills and `stream_backpressure`
+            // drops the frame instead of this loop holding a backlog.
+            Some(chunk) = chunk_rx.recv(), if pending_chunk.is_none() => {
+                pending_chunk = Some(chunk);
+            }
+            Ok(slot) = writer.stream_slots().acquire_owned(), if pending_chunk.is_some() => {
+                let Some(chunk) = pending_chunk.take() else { continue };
                 // AUTHORITY IS RE-CHECKED PER CHUNK, not once at stream_start.
                 // A revoked or expired session must stop delivering pixels that
                 // are already in flight, not merely refuse the next request.
@@ -1009,14 +1158,28 @@ async fn handle_client_connection(
                     }
                 };
                 let ct_len = noise.write_message(&framed, &mut buf)?;
-                if write_framed(&mut wr, &buf[..ct_len]).await.is_err() {
+                if let Err(why) = writer.queue_chunk(&buf[..ct_len], slot) {
+                    eprintln!("[host] closing the session: {why:?}");
                     break;
                 }
+            }
+            // The socket failed underneath the writer. Nothing more can be sent.
+            written = &mut writer_task => {
+                match written {
+                    Ok(Err(e)) => eprintln!("[host] session write failed: {e}"),
+                    Ok(Ok(())) => eprintln!("[host] session writer ended"),
+                    Err(e) => eprintln!("[host] session writer task failed: {e}"),
+                }
+                break;
             }
         }
     }
     drop(stream);
     reader.abort();
+    // Dropping the queue and the write half closes the socket now, rather than
+    // after whatever a peer that stopped reading still has waiting for it.
+    writer_task.abort();
+    drop(writer);
     end_session_and_release(&mut session);
 
     SESSION_ACTIVE.store(false, Ordering::SeqCst);
@@ -1280,17 +1443,26 @@ fn warn_about_malformed_capability_vars() {
     }
 }
 
+/// Is this command's capability granted, by either route?
+///
+/// TWO independent grants, and deny-by-default under both. A variable grants it
+/// for one run, which is how development and every test that sets `RD_CAP_*`
+/// works. The owner's stored settings grant it until they revoke it, which is
+/// what makes the application-grid icon usable at all — it sets no variables,
+/// so before `settings.json` the icon could only ever capture.
+///
+/// A malformed value (`RD_CAP_INPUT="1 "`, which `set VAR=1 && run.bat` produces
+/// on Windows) is still not a grant: the comparison is exact, and
+/// `warn_about_malformed_capability_vars` says so at startup.
+///
+/// Clipboard remains its own capability under both routes. A paired phone that
+/// may drive the mouse has not thereby been given the machine's clipboard,
+/// which holds things that were never on screen.
 fn capability_granted(cap: &str) -> bool {
-    let env = match cap {
-        "screenshot_request" => "RD_CAP_SCREENSHOT",
-        "input_event" => "RD_CAP_INPUT",
-        // Its own capability, off unless the operator sets it. A paired phone
-        // that may drive the mouse has not thereby been given the machine's
-        // clipboard, which holds things that were never on screen.
-        "clipboard" => "RD_CAP_CLIPBOARD",
-        _ => return false,
+    let Some(capability) = settings::Capability::for_command(cap) else {
+        return false;
     };
-    std::env::var(env).as_deref() == Ok("1")
+    std::env::var(capability.env_var()).as_deref() == Ok("1") || settings::granted(capability)
 }
 
 /// Minimal JSON string escaping for names echoed into responses.
@@ -1432,7 +1604,25 @@ fn json_denied(for_cmd: &str, reason: &str) -> String {
     format!(r#"{{"type":"denied","for":"{for_cmd}","reason":"{reason}"}}"#)
 }
 fn json_cap_denied(for_cmd: &str, env: &str) -> String {
-    json_denied(for_cmd, &format!("capability not authorized (set {env}=1)"))
+    json_denied(for_cmd, &cap_denied_reason(env))
+}
+
+/// What the phone is shown when the host has not been allowed to do something.
+///
+/// **It names the console first, and the variable second.** It used to name only
+/// the variable, which was right until the owner could grant a capability in the
+/// window: after that it was advice that costs more than the problem, because
+/// setting a variable means restarting the host, and restarting the host drops
+/// the very session the person is sitting in. The operator hit exactly that.
+///
+/// The variable is still named, because it is still how a development run or a
+/// launcher grants one for a single run, and a message that hid it would send
+/// someone reading the source looking for a setting that seemed to have gone.
+fn cap_denied_reason(env: &str) -> String {
+    format!(
+        "capability not authorized - allow it in the host window under \
+         'What this host may do', or start the host with {env}=1"
+    )
 }
 fn json_scope_denied(for_cmd: &str, err: &ShareError) -> String {
     // Typed denial from the ShareSession gate. Deliberately does not echo any
@@ -1779,16 +1969,12 @@ fn frame_gate(
     Ok(w)
 }
 
-/// Input gate: capability env grant + input authorized into a permitted surface
-/// + a parsed, geometry-clamped event. Returns the message to inject, or a
-/// denial. Every decision below is `session_core`'s; this function only reads
-/// the platform's geometry and the client's JSON.
-fn input_gate(
-    session: &ShareSession,
-    cmd: &serde_json::Value,
-    now: u64,
-) -> Result<module10::message::InputControlMessage, String> {
-    use module10::message::{InputControlMessage, MouseMoveMode};
+/// The two input checks that do not depend on the command: the capability is
+/// granted for this run, and the desktop is not locked.
+///
+/// Shared by [`input_gate`] and [`text_may_continue`] so the check made before
+/// a text run and the one repeated between its batches cannot drift apart.
+fn input_preconditions() -> Result<(), String> {
     if !capability_granted("input_event") {
         return Err(json_cap_denied("input_event", "RD_CAP_INPUT"));
     }
@@ -1799,6 +1985,34 @@ fn input_gate(
     if let Err(why) = lock_gate(lock_observation()) {
         return Err(json_denied("input_event", why));
     }
+    Ok(())
+}
+
+/// Whether a text run that has already started may type its next batch.
+///
+/// A paragraph takes a noticeable fraction of a second to type, and in that
+/// time the grant can be revoked, the session can expire, or — the case that
+/// matters most — the desktop can LOCK. The rest of the paragraph must not go
+/// into the lock screen's password field. So authority is asked again, by the
+/// same rules [`input_gate`] used, before every batch after the first.
+fn text_may_continue(session: &ShareSession, w: SurfaceId, now: u64) -> Result<(), String> {
+    input_preconditions()?;
+    session
+        .authorize_input(w, now)
+        .map_err(|e| json_scope_denied("input_event", &e))
+}
+
+/// Input gate: capability env grant + input authorized into a permitted surface
+/// + a parsed, geometry-clamped event. Returns the message to inject, or a
+/// denial. Every decision below is `session_core`'s; this function only reads
+/// the platform's geometry and the client's JSON.
+fn input_gate(
+    session: &ShareSession,
+    cmd: &serde_json::Value,
+    now: u64,
+) -> Result<module10::message::InputControlMessage, String> {
+    use module10::message::{InputControlMessage, MouseMoveMode};
+    input_preconditions()?;
     let w = surface_id_of(cmd).ok_or_else(|| json_err("input_event", "missing window id"))?;
     session
         .authorize_input(w, now)
@@ -1807,8 +2021,24 @@ fn input_gate(
         .get("event")
         .cloned()
         .ok_or_else(|| json_err("input_event", "missing event"))?;
-    let msg: InputControlMessage =
+    let mut msg: InputControlMessage =
         serde_json::from_value(event).map_err(|_| json_err("input_event", "bad event"))?;
+    let coordinates = input_coordinates::InputCoordinates::from_field(cmd, "coordinate_space")
+        .map_err(|why| json_err("input_event", why))?;
+    let geometry = if matches!(
+        &msg,
+        InputControlMessage::MouseMove {
+            mode: MouseMoveMode::Absolute,
+            ..
+        }
+    ) {
+        share_source::rect(w).map(|(l, t, r, b)| SurfaceGeometry::new(l, t, r, b))
+    } else {
+        None
+    };
+    coordinates
+        .convert(&mut msg, geometry)
+        .map_err(|why| json_err("input_event", why))?;
     // Clamp absolute pointer moves to the permitted surface's on-screen rect: a
     // granted peer can never steer the pointer outside what it was given.
     //
@@ -1826,7 +2056,6 @@ fn input_gate(
         ..
     } = &msg
     {
-        let geometry = share_source::rect(w).map(|(l, t, r, b)| SurfaceGeometry::new(l, t, r, b));
         session
             .authorize_absolute_input(w, now, geometry, *abs_x as i64, *abs_y as i64)
             .map_err(|e| json_scope_denied("input_event", &e))?;
@@ -1848,7 +2077,12 @@ async fn handle_screenshot_scoped(
     // Capture on a blocking thread: DXGI/GDI and the portal pull are synchronous
     // and would otherwise stall the runtime.
     match tokio::task::spawn_blocking(move || share_source::capture_rgba(w)).await {
-        Ok(Ok(frame)) => {
+        // Alive, and nothing on screen has changed since the capture was built.
+        Ok(Ok(None)) => {
+            eprintln!("[host] screenshot: {}", module11::StreamError::NoFrameYet);
+            Some(json_err("screenshot_request", "no_picture_yet"))
+        }
+        Ok(Ok(Some(frame))) => {
             let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
             sha2::Digest::update(&mut hasher, &frame.data);
             let digest = sha2::Digest::finalize(hasher);
@@ -1879,6 +2113,18 @@ async fn handle_screenshot_scoped(
             Some(json_err("screenshot_request", "capture_task_failed"))
         }
     }
+}
+
+/// Whether a capture that took `took` is worth "the source is stalling".
+///
+/// The warning is for a capture that does not come back. A capture waiting on
+/// a still desktop for its FIRST picture takes its full wait by design, every
+/// time, and a warning per wait would bury the log under a non-event.
+fn stall_is_worth_a_warning(
+    took: std::time::Duration,
+    result: &Result<Option<module11::RawFrame>, String>,
+) -> bool {
+    took >= SLOW_CAPTURE_WARN && !matches!(result, Ok(None))
 }
 
 /// Scoped input: gate on a permitted window + input control, clamp, then inject.
@@ -1916,89 +2162,326 @@ fn refuse_undelivered_input(session: &mut ShareSession) -> String {
     )
 }
 
-fn handle_input_scoped(
+/// Why one injected event did not go in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InjectFault {
+    /// The injector returned an error.
+    Failed,
+    /// It returned success, and Windows' read-back says the event never
+    /// reached the desktop (UIPI).
+    NotLanded,
+}
+
+/// Inject one event the way every input takes: into the kernel or
+/// `SendInput`, then the read-back.
+///
+/// **Not logged here.** Single events are logged by the caller before this
+/// runs; a text run is logged once, by length, before its first batch — a
+/// paragraph would otherwise be four thousand log lines whose pattern of
+/// `modifiers=0x01` spells out where its capitals are.
+fn inject_checked(m: &module10::message::InputControlMessage) -> Result<u32, InjectFault> {
+    let injected = match module10::inject::inject(m) {
+        Ok(injected) => u32::from(injected),
+        Err(e) => {
+            // Stop at the first failure rather than pressing on. Continuing
+            // could leave a modifier held down with no matching release.
+            eprintln!("[host] input injection failed: {e}");
+            return Err(InjectFault::Failed);
+        }
+    };
+    // DID IT ACTUALLY LAND? On Windows, `SendInput` returns the full event
+    // count while a higher-integrity foreground window swallows everything
+    // — UIPI, found by the Windows box on 2026-09-01. The host would
+    // otherwise record a press that never happened, later "release" it, and
+    // report a clean desktop it was never driving.
+    //
+    // The operator's decision, the same day: REFUSE A GRANT THE HOST CANNOT
+    // DELIVER. So the caller gives the grant back rather than carrying on,
+    // and the client is told why instead of watching its input vanish.
+    //
+    // `Unknown` — every platform without a read-back, which is every
+    // platform but Windows — is deliberately not a refusal.
+    if module10::inject::verify_delivery(m) == module10::inject::Delivery::NotLanded {
+        return Err(InjectFault::NotLanded);
+    }
+    Ok(injected)
+}
+
+/// Pause between batches of a text run.
+///
+/// Paired with `module10::keymap::TEXT_BATCH_EVENTS`: a batch is a third of the
+/// compositor's evdev buffer, and this is the gap in which it drains. Three
+/// batches fit, so the compositor may miss two pauses in a row — about four
+/// milliseconds of not reading — and lose nothing. A 2,000-character paragraph
+/// is a little over 400 batches: about a second. An ordinary few sentences is
+/// a fraction of that.
+///
+/// It is an ASYNC sleep and must stay one. The controller runs every session
+/// and the listener on one current-thread runtime; a `thread::sleep` here would
+/// freeze all of them for the length of the paragraph.
+const TEXT_BATCH_PAUSE: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// How a paced text run ended. `typed` is in characters of the SOURCE text —
+/// how much of what the operator wrote reached the desktop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TextRunEnd {
+    /// Every keystroke landed.
+    Complete { injected: u32 },
+    /// Authority ended between batches; `refusal` is what the gate says now.
+    Withdrawn {
+        typed: usize,
+        injected: u32,
+        refusal: String,
+    },
+    /// An event failed, or did not land; nothing after it was attempted.
+    Faulted {
+        typed: usize,
+        injected: u32,
+        fault: InjectFault,
+    },
+}
+
+/// Type a validated text run, batch by batch.
+///
+/// Generic over the three things it touches so the ORDERING can be tested
+/// without a kernel: what is injected, when authority is asked again, and when
+/// the run yields. Production passes `inject_checked`, `text_may_continue` and
+/// a tokio sleep.
+///
+/// * The first batch goes immediately; the gate has only just said yes.
+/// * Every later batch is preceded by a pause and then a fresh authority check.
+///   A refusal stops the run there: a revoked grant or a locked screen must not
+///   receive the rest of a paragraph.
+/// * A character counts as typed once its PRESS lands, since that is when it
+///   appears; a failed release after that still leaves the character typed.
+async fn run_text_plan<I, A, P, F>(
+    plan: &module10::keymap::TextPlan,
+    mut inject: I,
+    mut still_allowed: A,
+    mut pause: P,
+) -> TextRunEnd
+where
+    I: FnMut(&module10::message::InputControlMessage) -> Result<u32, InjectFault>,
+    A: FnMut() -> Result<(), String>,
+    P: FnMut() -> F,
+    F: std::future::Future<Output = ()>,
+{
+    let mut injected = 0u32;
+    let mut typed = 0usize;
+    for (i, batch) in plan.batches().into_iter().enumerate() {
+        if i > 0 {
+            pause().await;
+            if let Err(refusal) = still_allowed() {
+                return TextRunEnd::Withdrawn {
+                    typed,
+                    injected,
+                    refusal,
+                };
+            }
+        }
+        for key in batch {
+            match inject(&key.down) {
+                Ok(n) => injected += n,
+                Err(fault) => {
+                    return TextRunEnd::Faulted {
+                        typed,
+                        injected,
+                        fault,
+                    }
+                }
+            }
+            typed = key.chars_through;
+            match inject(&key.up) {
+                Ok(n) => injected += n,
+                Err(fault) => {
+                    return TextRunEnd::Faulted {
+                        typed,
+                        injected,
+                        fault,
+                    }
+                }
+            }
+        }
+    }
+    TextRunEnd::Complete { injected }
+}
+
+/// The client's id for a text run, when it sent one.
+///
+/// Only a `TextInput` command's id is honoured. The phone keeps what it sent
+/// under that id until the host says what became of it, so a refused or
+/// interrupted paragraph goes back into the compose field instead of being
+/// lost (RD-TEXT-1). An id on any other event is ignored, not echoed.
+fn text_id_of(cmd: &serde_json::Value) -> Option<u64> {
+    cmd.pointer("/event/TextInput")?;
+    cmd.get("text_id")?.as_u64()
+}
+
+/// Attach a text run's outcome to the reply its client will read.
+///
+/// **Only when the client sent a `text_id`.** A client that did not ask gets
+/// the reply byte for byte as before, so an older phone sees no change at all.
+/// `typed` is how many characters of its text reached the desktop; `extra`
+/// carries the refusal's specifics (`at` for an untypable character, `max` for
+/// a run over the ceiling). Both are numbers: the phone names the character
+/// from its own copy, so no user text is ever echoed into this JSON.
+fn tag_text_reply(
+    reply: String,
+    text_id: Option<u64>,
+    typed: usize,
+    extra: &[(&str, serde_json::Value)],
+) -> String {
+    let Some(id) = text_id else {
+        return reply;
+    };
+    let mut value: serde_json::Value = match serde_json::from_str(&reply) {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("[host] a text reply is not JSON; sending it without its text_id");
+            return reply;
+        }
+    };
+    let Some(obj) = value.as_object_mut() else {
+        eprintln!("[host] a text reply is not a JSON object; sending it without its text_id");
+        return reply;
+    };
+    obj.insert("text_id".into(), id.into());
+    obj.insert("typed".into(), typed.into());
+    for (k, v) in extra {
+        obj.insert((*k).into(), v.clone());
+    }
+    value.to_string()
+}
+
+/// Type a text run that has passed the gate, and say what became of it.
+async fn type_text_run(
     session: &mut ShareSession,
     cmd: &serde_json::Value,
-    now: u64,
-) -> Option<String> {
-    let msg = match input_gate(session, cmd, now) {
-        Ok(m) => m,
-        Err(resp) => return Some(resp),
-    };
+    msg: &module10::message::InputControlMessage,
+    text: &str,
+    text_id: Option<u64>,
+) -> String {
     // Text is expanded here, AFTER the gate. Doing it before would mean a run
     // of keystrokes had been built for a client that turned out not to hold
     // input control — and the expansion is the only part that can fail for a
     // reason the user can fix, so it must not be mixed up with authorisation.
-    let msgs = match &msg {
-        module10::message::InputControlMessage::TextInput { text } => {
-            match module10::keymap::text_to_messages(text) {
-                Ok(v) => v,
-                Err(module10::keymap::TextError::Unsupported { ch, at }) => {
-                    // The character is named in the LOG, not in the reply.
-                    // It is the peer's own text so echoing it leaks nothing,
-                    // but it would have to be escaped into JSON correctly on a
-                    // path where getting that wrong is a parser bug.
-                    eprintln!(
-                        "[host] refusing text: character {ch:?} at position {at} is not \
-                         typable on this layout"
-                    );
-                    return Some(json_err("input_event", "unsupported_character"));
-                }
-                Err(module10::keymap::TextError::TooLong { len, max }) => {
-                    eprintln!("[host] refusing text: {len} characters exceeds the {max} limit");
-                    return Some(json_err("input_event", "text_too_long"));
-                }
-            }
+    let plan = match module10::keymap::text_to_plan(text) {
+        Ok(p) => p,
+        Err(module10::keymap::TextError::Unsupported { ch, at }) => {
+            // The character is named in the LOG, not in the reply. The reply
+            // carries its POSITION, a number, and the phone names it from its
+            // own copy — no user text has to be escaped into this JSON.
+            eprintln!(
+                "[host] refusing text: character {ch:?} at position {at} is not \
+                 typable on this layout"
+            );
+            return tag_text_reply(
+                json_err("input_event", "unsupported_character"),
+                text_id,
+                0,
+                &[("at", at.into())],
+            );
         }
-        _ => vec![msg],
+        Err(module10::keymap::TextError::TooLong { len, max }) => {
+            eprintln!("[host] refusing text: {len} characters exceeds the {max} limit");
+            return tag_text_reply(
+                json_err("input_event", "text_too_long"),
+                text_id,
+                0,
+                &[("max", max.into())],
+            );
+        }
+    };
+    let Some(w) = surface_id_of(cmd) else {
+        // The gate has already refused a command without one; this is
+        // unreachable unless the two drift apart, and then it must refuse.
+        return tag_text_reply(
+            json_err("input_event", "missing window id"),
+            text_id,
+            0,
+            &[],
+        );
     };
 
-    // A text run is many events. Injecting them one at a time through the same
-    // path every other input takes means text inherits the modifier ordering
-    // and error handling that are already proven, rather than getting its own.
-    let mut injected_total = 0u32;
-    for m in &msgs {
-        // Log what is about to reach the kernel, BEFORE it does.
-        //
-        // Added 2026-08-30 after a button on the phone froze the operator's
-        // display hard enough to need the power button. Neither side logged a
-        // SUCCESSFUL press, so the record could not say which control caused it
-        // — the one question the log needed to answer.
-        //
-        // Keys, buttons and scrolls only: pointer moves arrive at 60-120 a
-        // second and would bury the events that matter. Nothing here prints
-        // TEXT — `TextInput` is named and its content is not, because it is
-        // whatever the operator typed, passwords included.
-        log_injection(m);
-        match module10::inject::inject(m) {
-            Ok(injected) => injected_total += u32::from(injected),
-            Err(e) => {
-                // Stop at the first failure rather than pressing on. Continuing
-                // could leave a modifier held down with no matching release.
-                eprintln!("[host] input injection failed: {e}");
-                return Some(json_err("input_event", "injection_failed"));
-            }
+    // Logged once, BEFORE the first key reaches the kernel, by length only
+    // (see `log_injection`) — the 2026-08-30 rule that the log must name the
+    // control that was in flight if the display freezes.
+    log_injection(msg);
+    let end = run_text_plan(
+        &plan,
+        inject_checked,
+        || text_may_continue(session, w, now_epoch_secs()),
+        || tokio::time::sleep(TEXT_BATCH_PAUSE),
+    )
+    .await;
+    let total = plan.total_chars;
+    match end {
+        TextRunEnd::Complete { injected } => tag_text_reply(
+            format!(r#"{{"type":"ack","for":"input_event","injected":{injected}}}"#),
+            text_id,
+            total,
+            &[],
+        ),
+        TextRunEnd::Withdrawn { typed, refusal, .. } => {
+            eprintln!(
+                "[input] text run stopped after {typed} of {total} characters: \
+                 input authority ended mid-run"
+            );
+            tag_text_reply(refusal, text_id, typed, &[])
         }
-
-        // DID IT ACTUALLY LAND? On Windows, `SendInput` returns the full event
-        // count while a higher-integrity foreground window swallows everything
-        // — UIPI, found by the Windows box on 2026-09-01. The host would
-        // otherwise record a press that never happened, later "release" it, and
-        // report a clean desktop it was never driving.
-        //
-        // The operator's decision, the same day: REFUSE A GRANT THE HOST CANNOT
-        // DELIVER. So the grant is given back here rather than carried on with,
-        // and the client is told why instead of watching its input vanish.
-        //
-        // `Unknown` — every platform without a read-back, which is every
-        // platform but Windows — is deliberately not a refusal.
-        if module10::inject::verify_delivery(m) == module10::inject::Delivery::NotLanded {
-            return Some(refuse_undelivered_input(session));
-        }
+        TextRunEnd::Faulted {
+            typed,
+            fault: InjectFault::Failed,
+            ..
+        } => tag_text_reply(
+            json_err("input_event", "injection_failed"),
+            text_id,
+            typed,
+            &[],
+        ),
+        TextRunEnd::Faulted {
+            typed,
+            fault: InjectFault::NotLanded,
+            ..
+        } => tag_text_reply(refuse_undelivered_input(session), text_id, typed, &[]),
     }
-    Some(format!(
-        r#"{{"type":"ack","for":"input_event","injected":{injected_total}}}"#
-    ))
+}
+
+async fn handle_input_scoped(
+    session: &mut ShareSession,
+    cmd: &serde_json::Value,
+    now: u64,
+) -> Option<String> {
+    let text_id = text_id_of(cmd);
+    let msg = match input_gate(session, cmd, now) {
+        Ok(m) => m,
+        // A text run refused at the gate typed nothing; the phone is told so,
+        // and puts the text back.
+        Err(resp) => return Some(tag_text_reply(resp, text_id, 0, &[])),
+    };
+    if let module10::message::InputControlMessage::TextInput { text } = &msg {
+        return Some(type_text_run(session, cmd, &msg, text, text_id).await);
+    }
+
+    // Log what is about to reach the kernel, BEFORE it does.
+    //
+    // Added 2026-08-30 after a button on the phone froze the operator's
+    // display hard enough to need the power button. Neither side logged a
+    // SUCCESSFUL press, so the record could not say which control caused it
+    // — the one question the log needed to answer.
+    //
+    // Keys, buttons and scrolls only: pointer moves arrive at 60-120 a
+    // second and would bury the events that matter. Nothing here prints
+    // TEXT — `TextInput` is named and its content is not, because it is
+    // whatever the operator typed, passwords included.
+    log_injection(&msg);
+    match inject_checked(&msg) {
+        Ok(injected) => Some(format!(
+            r#"{{"type":"ack","for":"input_event","injected":{injected}}}"#
+        )),
+        Err(InjectFault::Failed) => Some(json_err("input_event", "injection_failed")),
+        Err(InjectFault::NotLanded) => Some(refuse_undelivered_input(session)),
+    }
 }
 
 async fn dispatch_agent2_command(json: &str) -> Option<String> {
@@ -2112,14 +2595,6 @@ async fn recv_noise_msg(stream: &mut tokio::net::TcpStream) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Write a length-prefixed message to any async writer (the split write half
-/// during a streaming session).
-async fn write_framed<W: AsyncWriteExt + Unpin>(w: &mut W, data: &[u8]) -> std::io::Result<()> {
-    w.write_all(&(data.len() as u32).to_be_bytes()).await?;
-    w.write_all(data).await?;
-    Ok(())
-}
-
 /// The exact bytes one stream chunk becomes on the wire.
 ///
 /// A named function rather than three lines inside `select!` so a test can call
@@ -2171,6 +2646,7 @@ struct StreamController {
     /// passed the authorize_frame gate for this surface first" — and that was
     /// the whole check. See `chunk_send_decision`.
     surface: SurfaceId,
+    input_coordinates: input_coordinates::InputCoordinates,
     stop: std::sync::Arc<AtomicBool>,
     /// Set by the capture thread itself right before it returns — on a clean
     /// `stop` request *and* on an unrecoverable capture error. Distinct from
@@ -2203,7 +2679,12 @@ impl StreamController {
     /// JPEG-encodes with module11's encoder and chunks it onto the wire in the
     /// exact format the client already expects. The caller must have passed the
     /// `ShareSession` `authorize_frame` gate for this surface first.
-    fn start(quality: u8, tx: tokio::sync::mpsc::Sender<Vec<u8>>, surface: SurfaceId) -> Self {
+    fn start(
+        quality: u8,
+        tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+        surface: SurfaceId,
+        input_coordinates: input_coordinates::InputCoordinates,
+    ) -> Self {
         // Any previous fault belonged to a previous stream. Cleared here rather
         // than on stop, because a stream that fails never reaches its own
         // cleanup — and a warning left standing over a healthy stream is spent
@@ -2228,6 +2709,9 @@ impl StreamController {
                 let mut seq: u32 = 0;
                 let mut dropped: u64 = 0;
                 let mut last_geometry = None;
+                // "Waiting for the first picture" is said once per stream, not
+                // on every 2 s wait.
+                let mut said_waiting = false;
                 eprintln!(
                     "[host] surface stream started for surface {}",
                     surface.raw()
@@ -2250,15 +2734,47 @@ impl StreamController {
                     let capture_started = std::time::Instant::now();
                     let capture_result = share_source::capture_rgba(surface);
                     let capture_took = capture_started.elapsed();
-                    if capture_took >= SLOW_CAPTURE_WARN {
+                    if stall_is_worth_a_warning(capture_took, &capture_result) {
                         eprintln!(
                             "[host] capture took {} ms — the source is stalling",
                             capture_took.as_millis()
                         );
                     }
                     match capture_result {
-                        Ok(raw) => {
-                            let (w, h) = (raw.width, raw.height);
+                        // Alive and still: a damage-driven stream has sent
+                        // nothing since the capture was built. Wait and ask
+                        // again — ending the stream here is what sent the
+                        // operator looking for a permission dialog on
+                        // 2026-09-18, twice.
+                        Ok(None) => {
+                            if !said_waiting {
+                                eprintln!(
+                                    "[host] surface {} waiting for the first picture: {}",
+                                    surface.raw(),
+                                    module11::StreamError::NoFrameYet
+                                );
+                                said_waiting = true;
+                            }
+                        }
+                        Ok(Some(raw)) => {
+                            // The lower rungs send fewer PIXELS: downscale the
+                            // captured frame before encoding so a link too slow
+                            // for full-resolution frames keeps a steady frame
+                            // rate instead of dropping most of them. The header
+                            // then declares the SMALLER dimensions — which is
+                            // what the phone requires (it drops any frame whose
+                            // declared size differs from the decoded JPEG) and
+                            // already copes with as a geometry change. Native
+                            // rungs take the else branch and copy nothing.
+                            let scale_pct = input_coordinates.scale_pct(rung.scale_pct);
+                            let scaled;
+                            let frame: &module11::RawFrame = if scale_pct < 100 {
+                                scaled = module11::downscale_rgba(&raw, scale_pct);
+                                &scaled
+                            } else {
+                                &raw
+                            };
+                            let (w, h) = (frame.width, frame.height);
                             if last_geometry.replace((w, h)) != Some((w, h)) {
                                 eprintln!(
                                     "[host] surface {} stream geometry: {w}x{h}",
@@ -2266,7 +2782,7 @@ impl StreamController {
                                 );
                             }
                             match encoder.encode(
-                                &raw,
+                                frame,
                                 quality,
                                 module11::ChromaSubsampling::Yuv420,
                                 None,
@@ -2375,10 +2891,26 @@ impl StreamController {
             .expect("spawn stream thread");
         Self {
             surface,
+            input_coordinates,
             stop,
             finished,
         }
     }
+}
+
+fn stream_start_coordinates(
+    command: &serde_json::Value,
+    active: Option<&StreamController>,
+    surface: SurfaceId,
+) -> Result<input_coordinates::InputCoordinates, &'static str> {
+    let coordinates =
+        input_coordinates::InputCoordinates::from_field(command, "input_coordinates")?;
+    if let Some(stream) = active.filter(|stream| !stream.is_finished()) {
+        if stream.surface != surface || stream.input_coordinates != coordinates {
+            return Err("stop the active stream before changing its surface or coordinate space");
+        }
+    }
+    Ok(coordinates)
 }
 
 impl Drop for StreamController {
@@ -2389,6 +2921,67 @@ impl Drop for StreamController {
 
 #[cfg(test)]
 mod tests {
+
+    /// A capture waiting for its first picture on a still desktop takes its
+    /// full wait every time, by design; that is not "the source is stalling".
+    /// A slow capture that DID return something, or failed, still is.
+    #[test]
+    fn a_wait_for_the_first_picture_is_not_reported_as_a_stall() {
+        let slow = super::SLOW_CAPTURE_WARN;
+        let fast = std::time::Duration::from_millis(5);
+        assert!(!super::stall_is_worth_a_warning(slow, &Ok(None)));
+        assert!(super::stall_is_worth_a_warning(slow, &Err("x".into())));
+        assert!(super::stall_is_worth_a_warning(
+            slow,
+            &Ok(Some(module11::RawFrame {
+                data: vec![0; 4],
+                width: 1,
+                height: 1,
+            }))
+        ));
+        assert!(!super::stall_is_worth_a_warning(fast, &Err("x".into())));
+    }
+
+    /// Only "no picture yet" keeps the capture source. Dropping it there made a
+    /// still desktop pay a fresh portal handshake, and fail the same way again.
+    #[test]
+    fn only_no_picture_yet_keeps_the_capture_source() {
+        assert!(crate::share_source::keeps_the_source(
+            &module11::StreamError::NoFrameYet
+        ));
+        for e in [
+            module11::StreamError::CaptureFailed,
+            module11::StreamError::EncodeFailed,
+            module11::StreamError::MuxerCongested,
+        ] {
+            assert!(!crate::share_source::keeps_the_source(&e), "{e:?}");
+        }
+    }
+
+    /// **The refusal must not tell the operator to do the expensive thing.**
+    ///
+    /// It used to say only "set RD_CAP_INPUT=1", which means restarting the
+    /// host — and restarting the host drops the live session the person is
+    /// sitting in. Since capabilities can be granted in the window and kept,
+    /// the console comes first. The variable is still named, because it is
+    /// still how a launcher or a development run grants one for a single run.
+    #[test]
+    fn a_refused_capability_points_at_the_console_before_the_variable() {
+        let reason = super::cap_denied_reason("RD_CAP_INPUT");
+        let console_at = reason.find("host window").expect(&reason);
+        let variable_at = reason.find("RD_CAP_INPUT").expect(&reason);
+        assert!(
+            console_at < variable_at,
+            "the refusal names the variable before the console, which is the advice that \
+             costs a live session: {reason}"
+        );
+        assert!(
+            reason.contains("What this host may do"),
+            "the refusal does not name the section of the window to look in: {reason}"
+        );
+        // Still machine-readable the same way: the phone matches on this prefix.
+        assert!(reason.starts_with("capability not authorized"), "{reason}");
+    }
 
     // ------------------------------------------- which invite a route mints
 
@@ -2411,6 +3004,7 @@ mod tests {
             &host_controller::Reach::Bound("192.168.1.20:8082".parse().unwrap()),
             1000,
             &caps,
+            false,
         )
         .expect("a bound host could not mint");
         match &bound {
@@ -2418,7 +3012,7 @@ mod tests {
                 assert_eq!(i.invite.version, pairing::INVITE_VERSION);
                 assert_eq!(i.invite.addr, "192.168.1.20");
             }
-            Minted::Relay(_) => panic!("a bound host minted a relay invite"),
+            Minted::Relay(_) | Minted::Dual(_) => panic!("a bound host minted a relay invite"),
         }
 
         let relay = mint_for(
@@ -2429,6 +3023,7 @@ mod tests {
             },
             1000,
             &caps,
+            false,
         )
         .expect("a dialled-out host could not mint");
         match &relay {
@@ -2437,7 +3032,98 @@ mod tests {
                 assert_eq!(i.invite.relay_addr, "203.0.113.9");
                 assert_eq!(i.invite.session, "Zm9vYmFyYmF6cXV4MDAwMA");
             }
-            Minted::Direct(_) => panic!("a dialled-out host minted a direct invite"),
+            Minted::Direct(_) | Minted::Dual(_) => {
+                panic!("a dialled-out host minted an invite naming a LAN route")
+            }
+        }
+    }
+
+    /// **A host serving both routes mints the relay code** until the operator
+    /// opts in to codes carrying both: v5 is the default route and every
+    /// installed app can read it.
+    #[test]
+    fn a_host_serving_both_routes_mints_the_relay_code_by_default() {
+        let caps = vec![pairing::CAP_VIEW.to_string()];
+        let mut svc = mint_service();
+        let minted = mint_for(
+            &mut svc,
+            &host_controller::Reach::Both {
+                bound: "192.168.1.20:8082".parse().unwrap(),
+                relay: "203.0.113.9:9443".parse().unwrap(),
+                session: "Zm9vYmFyYmF6cXV4MDAwMA".into(),
+            },
+            1000,
+            &caps,
+            false,
+        )
+        .expect("a host serving both routes could not mint");
+        match &minted {
+            Minted::Relay(i) => {
+                assert_eq!(i.invite.version, pairing::RELAY_INVITE_VERSION);
+                assert_eq!(i.invite.relay_addr, "203.0.113.9");
+                assert_eq!(i.invite.relay_port, 9443);
+                assert_eq!(i.invite.session, "Zm9vYmFyYmF6cXV4MDAwMA");
+            }
+            Minted::Direct(_) => panic!("a host serving both routes minted a LAN-only code"),
+            Minted::Dual(_) => panic!("a host that did not opt in minted a both-routes code"),
+        }
+    }
+
+    /// **With the operator's opt-in, a host serving both routes mints v6**,
+    /// naming both under one signature — and the opt-in changes nothing for a
+    /// host with one route, which still mints the code every app can read.
+    #[test]
+    fn the_both_routes_code_is_minted_only_for_both_routes_and_only_when_asked() {
+        let caps = vec![pairing::CAP_VIEW.to_string()];
+        let mut svc = mint_service();
+        let session = "Zm9vYmFyYmF6cXV4MDAwMA";
+        let both = host_controller::Reach::Both {
+            bound: "192.168.1.20:8082".parse().unwrap(),
+            relay: "203.0.113.9:9443".parse().unwrap(),
+            session: session.into(),
+        };
+        let minted = mint_for(&mut svc, &both, 1000, &caps, true).unwrap();
+        match &minted {
+            Minted::Dual(i) => {
+                assert_eq!(i.invite.version, pairing::DUAL_INVITE_VERSION);
+                assert_eq!(
+                    (i.invite.addr.as_str(), i.invite.port),
+                    ("192.168.1.20", 8082)
+                );
+                assert_eq!(
+                    (i.invite.relay_addr.as_str(), i.invite.relay_port),
+                    ("203.0.113.9", 9443)
+                );
+                assert_eq!(i.invite.session, session);
+            }
+            _ => panic!("an opted-in host serving both routes did not mint v6"),
+        }
+        assert_eq!(minted.carries(), "both routes");
+        let line = minted.describe();
+        assert!(
+            !line.contains(session),
+            "the log line carried the session id: {line}"
+        );
+
+        for (reach, want) in [
+            (
+                host_controller::Reach::Bound("192.168.1.20:8082".parse().unwrap()),
+                pairing::INVITE_VERSION,
+            ),
+            (
+                host_controller::Reach::ViaRelay {
+                    relay: "203.0.113.9:9443".parse().unwrap(),
+                    session: session.into(),
+                },
+                pairing::RELAY_INVITE_VERSION,
+            ),
+        ] {
+            let version = match mint_for(&mut svc, &reach, 1000, &caps, true).unwrap() {
+                Minted::Direct(i) => i.invite.version,
+                Minted::Relay(i) => i.invite.version,
+                Minted::Dual(_) => panic!("{reach:?} minted a both-routes code it cannot honour"),
+            };
+            assert_eq!(version, want, "{reach:?}");
         }
     }
 
@@ -2457,6 +3143,7 @@ mod tests {
             },
             1000,
             &caps,
+            false,
         )
         .unwrap();
 
@@ -2468,6 +3155,7 @@ mod tests {
         let token = match &minted {
             Minted::Relay(i) => i.invite.token.clone(),
             Minted::Direct(i) => i.invite.token.clone(),
+            Minted::Dual(i) => i.invite.token.clone(),
         };
         assert!(
             !line.contains(&token),
@@ -2490,6 +3178,7 @@ mod tests {
             &host_controller::Reach::Bound("192.168.1.20:8082".parse().unwrap()),
             1000,
             &caps,
+            false,
         )
         .unwrap()
         .into_view();
@@ -2501,6 +3190,7 @@ mod tests {
             },
             1000,
             &caps,
+            false,
         )
         .unwrap()
         .into_view();
@@ -3052,6 +3742,190 @@ mod tests {
         );
     }
 
+    /// Pair `device` and hand back the live socket and Noise transport, with the
+    /// client's receive buffer made small so the host's replies back up fast.
+    ///
+    /// The other helpers drop the session once `pair_ok` arrives. This one keeps
+    /// it, because a stalled session is only a stalled session while it is open.
+    async fn open_session_that_reads_slowly(
+        addr: std::net::SocketAddr,
+        device: &snow::Keypair,
+        token: &str,
+        expected_host_pub: &[u8],
+    ) -> (tokio::net::TcpStream, snow::TransportState) {
+        let sock = tokio::net::TcpSocket::new_v4().unwrap();
+        sock.set_recv_buffer_size(4096).unwrap();
+        let mut socket = sock.connect(addr).await.unwrap();
+        let mut handshake = snow::Builder::new(NOISE_PATTERN.parse().unwrap())
+            .local_private_key(&device.private)
+            .build_initiator()
+            .unwrap();
+        let mut buf = vec![0u8; 65535];
+        let len = handshake.write_message(&[], &mut buf).unwrap();
+        send_noise_msg(&mut socket, &buf[..len]).await.unwrap();
+        let message = recv_noise_msg(&mut socket).await.unwrap();
+        handshake.read_message(&message, &mut buf).unwrap();
+        assert_eq!(handshake.get_remote_static(), Some(expected_host_pub));
+        let len = handshake.write_message(&[], &mut buf).unwrap();
+        send_noise_msg(&mut socket, &buf[..len]).await.unwrap();
+        let mut noise = handshake.into_transport_mode().unwrap();
+        let auth = serde_json::to_vec(&PairAuth {
+            token: token.to_string(),
+            protocol: pairing::SESSION_PROTOCOL.to_string(),
+            version: SESSION_PROTOCOL_VERSION,
+        })
+        .unwrap();
+        let len = noise.write_message(&auth, &mut buf).unwrap();
+        send_noise_msg(&mut socket, &buf[..len]).await.unwrap();
+        let reply = recv_noise_msg(&mut socket).await.unwrap();
+        let len = noise.read_message(&reply, &mut buf).unwrap();
+        let reply: serde_json::Value = serde_json::from_slice(&buf[..len]).unwrap();
+        assert_eq!(reply["type"], "pair_ok");
+        (socket, noise)
+    }
+
+    /// Send `count` pings from a task and never read a reply. The count sent so far
+    /// is shared, because once the host stops reading these writes block too, and
+    /// the test must not block with them.
+    fn send_pings_never_read(
+        mut socket: tokio::net::TcpStream,
+        mut noise: snow::TransportState,
+        count: usize,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let progress = sent.clone();
+        let task = tokio::spawn(async move {
+            let ping = wire::Envelope::new(wire::Kind::Ping, 0, Vec::new())
+                .unwrap()
+                .encode();
+            let mut buf = vec![0u8; 65535];
+            for _ in 0..count {
+                let len = noise.write_message(&ping, &mut buf).unwrap();
+                if send_noise_msg(&mut socket, &buf[..len]).await.is_err() {
+                    break;
+                }
+                progress.fetch_add(1, Ordering::Relaxed);
+            }
+            // Hold the socket open, unread, until the test ends.
+            std::future::pending::<()>().await;
+        });
+        (task, sent)
+    }
+
+    /// A device revoked while its session is STALLED is still disconnected, within
+    /// one heartbeat.
+    ///
+    /// Found on the operator's phone, 2026-09-13: over a lossy Wi-Fi link the
+    /// session loop sat in `write_framed(...).await` for seconds at a time, and
+    /// that same loop is the only thing that handles input, runs the idle key
+    /// release and checks revocation. So a network stall froze all three. A peer
+    /// that simply stops reading freezes them for as long as it likes.
+    ///
+    /// No capture in the gate, so the stall is made with replies instead of
+    /// frames: the client sends pings and never reads a pong. The session must
+    /// still be open while stalled — otherwise a cap closing it would pass this
+    /// test for the wrong reason — and must close once the device is revoked.
+    #[tokio::test]
+    async fn a_device_revoked_while_its_session_is_stalled_is_disconnected() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_loopback_test_state();
+        let identity = test_host_identity();
+        let mut pairing = test_pairing_service();
+        let token = real_invite_token(&mut pairing);
+        let (addr, host, _auth, devices) = start_loopback_host_serving(&pairing, 1).await;
+
+        let device = snow::Builder::new(NOISE_PATTERN.parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let (socket, noise) =
+            open_session_that_reads_slowly(addr, &device, &token, &identity.public).await;
+
+        let (pinger, sent) = send_pings_never_read(socket, noise, STALL_PINGS);
+
+        // Wait until every ping is sent or sending has stopped moving: either
+        // way the host now owes more pongs than the sockets can hold. A fixed
+        // sleep would race a slow machine.
+        let mut last = usize::MAX;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let now = sent.load(Ordering::Relaxed);
+            if now == STALL_PINGS || now == last {
+                break;
+            }
+            last = now;
+        }
+        eprintln!(
+            "stall established after {} of {STALL_PINGS} pings",
+            sent.load(Ordering::Relaxed)
+        );
+        assert!(
+            !host.is_finished(),
+            "the session closed before the device was revoked — whatever closed it, \
+             this test is no longer measuring revocation"
+        );
+
+        let key: [u8; 32] = device.public.clone().try_into().unwrap();
+        assert!(
+            devices.revoke(&key, now_epoch_secs()),
+            "revoke must find the record"
+        );
+
+        // One 5 s heartbeat plus margin.
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(8), host).await;
+        pinger.abort();
+        assert!(
+            closed.is_ok(),
+            "a revoked device's stalled session was still open 8 s after revocation: \
+             the session loop is waiting on a write and never reaches its heartbeat"
+        );
+    }
+
+    /// A pong is 28 bytes on the wire (4 length + 8 envelope header + 16 Noise
+    /// tag), and Linux lets a TCP send buffer grow to `net.core.wmem_max` — 4 MB
+    /// on the box this was written on. 60 000 pings (1.7 MB) never stalled
+    /// anything, which is how the first draft of this test passed against the
+    /// defect it names. 250 000 is 7 MB: past the kernel's ceiling with margin.
+    const STALL_PINGS: usize = 250_000;
+
+    /// A peer that keeps talking and never reads a reply is disconnected, not
+    /// buffered for without end.
+    ///
+    /// Moving writes off the session loop is what lets revocation reach a stalled
+    /// session — and it is also what would let a peer that never reads grow the
+    /// host by one queued reply per command. `session_writer::MAX_UNWRITTEN_BYTES`
+    /// is the bound; this proves it closes a real session and is not only a
+    /// counter in a unit test. Before the writer existed the loop never closed
+    /// such a session either: it waited on the write forever.
+    #[tokio::test]
+    async fn a_session_whose_peer_never_reads_is_closed_not_buffered() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_loopback_test_state();
+        let identity = test_host_identity();
+        let mut pairing = test_pairing_service();
+        let token = real_invite_token(&mut pairing);
+        let (addr, host, _auth, _devices) = start_loopback_host_serving(&pairing, 1).await;
+
+        let device = snow::Builder::new(NOISE_PATTERN.parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let (socket, noise) =
+            open_session_that_reads_slowly(addr, &device, &token, &identity.public).await;
+        // 28 bytes a pong: this owes the peer well past the cap plus anything
+        // the kernel could hold.
+        let pings = 2 * session_writer::MAX_UNWRITTEN_BYTES / 28;
+        let (pinger, _sent) = send_pings_never_read(socket, noise, pings);
+
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(30), host).await;
+        pinger.abort();
+        assert!(
+            closed.is_ok(),
+            "a session whose peer read nothing was still open after 30 s of it sending"
+        );
+    }
+
     /// The property Block 9 must NOT weaken: a spent token stays spent, even
     /// for a device the host now knows.
     #[tokio::test]
@@ -3358,6 +4232,379 @@ mod tests {
             handle_client_connection(socket, tokens, devices, notifier).await
         });
         (session, task)
+    }
+
+    // ─────────────────── paired reconnect through the relay (P4, phone half)
+    //
+    // The helpers above are the wrong shape for this, and a test built on them
+    // would not test it: `start_loopback_relay` authenticates hosts by BEARER
+    // token, which the relay answers with a fresh random session id every time,
+    // and `start_dialling_host` builds its own device store and serves one
+    // peer. A paired reconnect needs a SIGNING relay (the only kind that gives a
+    // host a stable id), one device store shared by the pairing and the
+    // reconnect, and a host that can go away and come back.
+
+    /// A real relay that authenticates hosts by their signed identity, as the
+    /// operator's relay does.
+    async fn start_signing_relay(hosts: &[relay::auth::HostIdentity]) -> std::net::SocketAddr {
+        let r = relay::Relay::new(Box::new(relay::auth::EnrolThenProve::new(hosts)));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    continue;
+                };
+                let r2 = r.clone();
+                tokio::spawn(async move {
+                    let _ = relay::serve_connection(&r2, sock).await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// One RUN of a host dialling out with its signing identity: register, serve
+    /// one client from the given device store, and exit — which drops the
+    /// control connection, as a host that is stopped or restarted does.
+    ///
+    /// Returns the session id the relay issued this run.
+    async fn one_signing_host_run(
+        pairing: &pairing::PairingService,
+        relay_addr: std::net::SocketAddr,
+        host_key: &ed25519_dalek::SigningKey,
+        devices: pairing::devices::DeviceHandle,
+    ) -> (String, tokio::task::JoinHandle<Result<()>>) {
+        use host_controller::DialOut;
+        let mut dial = crate::relay_dial::RelayDialOut::new(
+            relay_addr,
+            crate::relay_dial::RelayCredential::Signing(host_key.clone()),
+        );
+        let mut source = dial
+            .connect()
+            .await
+            .expect("an enrolled host could not register with the signing relay");
+        let session = match source.reach() {
+            host_controller::Reach::ViaRelay { session, .. } => session,
+            other => panic!("a dialled-out host reported {other:?}"),
+        };
+        let tokens = pairing.redemption_handle();
+        let (auth_tx, _auth_rx) = tokio::sync::mpsc::unbounded_channel();
+        let notifier = host_controller::AuthNotifier::new(auth_tx, "via relay".to_string());
+        let task = tokio::spawn(async move {
+            let (socket, _addr, _label) = source
+                .next_peer()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("the relay never handed the host a client"))?;
+            let outcome = handle_client_connection(socket, tokens, devices, notifier).await;
+            // `source` — the control connection — is dropped here, with the run.
+            drop(source);
+            outcome
+        });
+        (session, task)
+    }
+
+    fn signing_host_key() -> (ed25519_dalek::SigningKey, relay::auth::HostIdentity) {
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let id = relay::auth::HostIdentity(sk.verifying_key().to_bytes());
+        (sk, id)
+    }
+
+    /// **THE P4 PROPERTY, end to end, with the client the phone runs.**
+    ///
+    /// Pair through the relay with a real QR token. Stop the host — its control
+    /// connection goes. Start it again — it registers afresh. Then reconnect
+    /// with NO TOKEN, presenting the session id kept from the pairing.
+    ///
+    /// Before P4 this could not work twice over: the relay gave the restarted
+    /// host a new random id, so the kept one named nothing; and the client
+    /// refused a paired relay reconnect outright, with "a paired reconnect has
+    /// no relay session to present".
+    #[tokio::test]
+    async fn the_shipping_client_reconnects_through_the_relay_after_the_host_restarts() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_loopback_test_state();
+        persistent_client_identity();
+        let identity = test_host_identity();
+        let mut pairing = test_pairing_service();
+        let token = real_invite_token(&mut pairing);
+        let (host_key, host_id) = signing_host_key();
+        let relay_addr = start_signing_relay(&[host_id]).await;
+        // ONE store across both runs: the host's enrolled devices are on disk and
+        // survive its restart, which is the whole reason a reconnect can work.
+        let devices = pairing::devices::DeviceHandle::new();
+
+        let (kept_session, first_run) =
+            one_signing_host_run(&pairing, relay_addr, &host_key, devices.clone()).await;
+        let paired = remotedexter::PinnedNoiseSession::connect_via_relay(
+            relay_addr.ip().to_string(),
+            relay_addr.port(),
+            kept_session.clone(),
+            token,
+            identity.public.to_vec(),
+        )
+        .await;
+        assert!(
+            paired.is_ok(),
+            "pairing through the signing relay failed: {:?}",
+            paired.as_ref().err()
+        );
+        drop(paired);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), first_run).await;
+        assert_eq!(
+            devices.snapshot().len(),
+            1,
+            "the pairing did not enroll this device"
+        );
+
+        // The host restarts: a new run, a new control connection, a new
+        // registration with the same identity.
+        let (second_session, second_run) =
+            one_signing_host_run(&pairing, relay_addr, &host_key, devices.clone()).await;
+        assert_eq!(
+            second_session, kept_session,
+            "the relay gave the restarted host a different session id, so the one the phone \
+             kept names nothing"
+        );
+
+        let again = remotedexter::PinnedNoiseSession::connect_paired_via_relay(
+            relay_addr.ip().to_string(),
+            relay_addr.port(),
+            kept_session,
+            identity.public.to_vec(),
+        )
+        .await;
+        assert!(
+            again.is_ok(),
+            "the shipping client could not reconnect through the relay with no token after a \
+             host restart: {:?}",
+            again.as_ref().err()
+        );
+        drop(again);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), second_run).await;
+    }
+
+    /// **The phone's own session loop, through the relay, with no token.**
+    ///
+    /// The test above calls `connect_paired_via_relay` directly. The phone does
+    /// not: its JNI entry runs `run_paired_relay_session`, which goes through
+    /// `run_session` and the `(ViaRelay, Paired)` arm that used to refuse with
+    /// "a paired reconnect has no relay session to present". Only a test that
+    /// drives THAT function proves the arm is wired — and it proves more than a
+    /// handshake: commands flow over the relayed session and it shuts down
+    /// cleanly, which is what the phone actually does after reconnecting.
+    #[tokio::test]
+    async fn the_production_session_loop_reconnects_through_the_relay_without_a_token() {
+        use remotedexter::CommandRejection;
+
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_loopback_test_state();
+        persistent_client_identity();
+        let identity = test_host_identity();
+        let mut pairing = test_pairing_service();
+        let token = real_invite_token(&mut pairing);
+        let (host_key, host_id) = signing_host_key();
+        let relay_addr = start_signing_relay(&[host_id]).await;
+        let devices = pairing::devices::DeviceHandle::new();
+
+        let (kept_session, first_run) =
+            one_signing_host_run(&pairing, relay_addr, &host_key, devices.clone()).await;
+        remotedexter::PinnedNoiseSession::connect_via_relay(
+            relay_addr.ip().to_string(),
+            relay_addr.port(),
+            kept_session.clone(),
+            token,
+            identity.public.to_vec(),
+        )
+        .await
+        .expect("pairing through the signing relay must succeed");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), first_run).await;
+
+        // The host restarts.
+        let (_, second_run) =
+            one_signing_host_run(&pairing, relay_addr, &host_key, devices.clone()).await;
+
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        remotedexter::set_agent2_observer_for_test(move |json| {
+            sink.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(json.to_string());
+        });
+
+        let client = tokio::spawn(remotedexter::run_paired_relay_session(
+            relay_addr.ip().to_string(),
+            relay_addr.port(),
+            kept_session,
+            identity.public.clone(),
+        ));
+
+        let claimed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if remotedexter::submit_session_command(r#"{"type":"ping"}"#)
+                    != Err(CommandRejection::NoSession)
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            claimed.is_ok(),
+            "the relayed session never claimed the command channel"
+        );
+
+        let got = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if !seen.lock().unwrap_or_else(|p| p.into_inner()).is_empty() {
+                    return;
+                }
+                if client.is_finished() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let replies = seen.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert!(
+            got.is_ok() && !replies.is_empty(),
+            "no reply crossed the relayed, token-less session; the client ended with: {:?}",
+            if client.is_finished() {
+                Some(client.await.map(|r| r.map_err(|e| e.to_string())))
+            } else {
+                None
+            }
+        );
+        assert_eq!(field(&replies[0], "type").as_deref(), Some("pong"));
+
+        assert_eq!(remotedexter::request_session_shutdown(), Ok(()));
+        tokio::time::timeout(std::time::Duration::from_secs(10), client)
+            .await
+            .expect("the relayed session did not finish after shutdown")
+            .expect("client task panicked")
+            .expect("the relayed session ended in error");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), second_run).await;
+    }
+
+    /// **Revocation binds the relay route too.** The same client, the same kept
+    /// session id, the same host pin — refused, because the owner revoked it.
+    /// A relay reconnect must not be a way around the lever that matters for a
+    /// lost phone.
+    #[tokio::test]
+    async fn a_revoked_device_cannot_reconnect_through_the_relay() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_loopback_test_state();
+        persistent_client_identity();
+        let identity = test_host_identity();
+        let mut pairing = test_pairing_service();
+        let token = real_invite_token(&mut pairing);
+        let (host_key, host_id) = signing_host_key();
+        let relay_addr = start_signing_relay(&[host_id]).await;
+        let devices = pairing::devices::DeviceHandle::new();
+
+        let (kept_session, first_run) =
+            one_signing_host_run(&pairing, relay_addr, &host_key, devices.clone()).await;
+        remotedexter::PinnedNoiseSession::connect_via_relay(
+            relay_addr.ip().to_string(),
+            relay_addr.port(),
+            kept_session.clone(),
+            token,
+            identity.public.to_vec(),
+        )
+        .await
+        .expect("pairing through the signing relay must succeed");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), first_run).await;
+
+        let listed = devices.snapshot();
+        assert_eq!(listed.len(), 1, "one pairing should enroll one device");
+        devices.revoke(&listed[0].public_key, now_epoch_secs());
+
+        let (_, second_run) =
+            one_signing_host_run(&pairing, relay_addr, &host_key, devices.clone()).await;
+        let after = remotedexter::PinnedNoiseSession::connect_paired_via_relay(
+            relay_addr.ip().to_string(),
+            relay_addr.port(),
+            kept_session,
+            identity.public.to_vec(),
+        )
+        .await;
+        let why = match &after {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a revoked device reconnected through the relay"),
+        };
+        // The REASON, not merely a failure: a relay refusal or a pin mismatch
+        // would also fail, and would mean revocation was never reached. The
+        // HOST refused — and the test above, identical but unrevoked, is the
+        // control that shows nothing else in this setup refuses.
+        assert!(
+            why.contains("pairing refused by host"),
+            "the reconnect failed, but not because the host refused the revoked device: {why}"
+        );
+        second_run.abort();
+    }
+
+    /// **A session id kept from before a RELAY restart is refused, and says the
+    /// relay refused it.**
+    ///
+    /// The relay derives ids through a key it holds only in memory, so a relay
+    /// restart changes every host's id. Simulated here with a second relay: the
+    /// same host registers with it and gets a different id, and the id the phone
+    /// kept from the first is refused. The phone cannot tell this from a host
+    /// that is not running — the relay says the same thing for both, on purpose
+    /// — but it must at least say the RELAY refused, not blame the host key or
+    /// report a timeout.
+    #[tokio::test]
+    async fn a_session_id_from_before_a_relay_restart_is_refused_by_the_relay() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_loopback_test_state();
+        persistent_client_identity();
+        let identity = test_host_identity();
+        let mut pairing = test_pairing_service();
+        let token = real_invite_token(&mut pairing);
+        let (host_key, host_id) = signing_host_key();
+        let devices = pairing::devices::DeviceHandle::new();
+
+        let before = start_signing_relay(&[relay::auth::HostIdentity(host_id.0)]).await;
+        let (kept_session, first_run) =
+            one_signing_host_run(&pairing, before, &host_key, devices.clone()).await;
+        remotedexter::PinnedNoiseSession::connect_via_relay(
+            before.ip().to_string(),
+            before.port(),
+            kept_session.clone(),
+            token,
+            identity.public.to_vec(),
+        )
+        .await
+        .expect("pairing through the first relay must succeed");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), first_run).await;
+
+        // "The relay restarted": a relay with a fresh key, the same host on it.
+        let after_restart = start_signing_relay(&[host_id]).await;
+        let (new_session, second_run) =
+            one_signing_host_run(&pairing, after_restart, &host_key, devices.clone()).await;
+        assert_ne!(
+            new_session, kept_session,
+            "two relay processes gave one host the same id, so the id is not keyed per relay"
+        );
+
+        let stale = remotedexter::PinnedNoiseSession::connect_paired_via_relay(
+            after_restart.ip().to_string(),
+            after_restart.port(),
+            kept_session,
+            identity.public.to_vec(),
+        )
+        .await;
+        let why = match &stale {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a session id from before the relay restart still opened a session"),
+        };
+        assert!(
+            why.contains("the relay refused this session"),
+            "a stale relay session must be reported as the relay refusing it: {why}"
+        );
+        second_run.abort();
     }
 
     /// **The whole loop, through a relay.** Host dials out, client scans a
@@ -4208,7 +5455,12 @@ mod tests {
     #[tokio::test]
     async fn stream_controller_is_window_scoped_and_fails_closed() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-        let ctl = StreamController::start(75, tx, SurfaceId::new(0));
+        let ctl = StreamController::start(
+            75,
+            tx,
+            SurfaceId::new(0),
+            input_coordinates::InputCoordinates::DesktopPixels,
+        );
         let closed = loop {
             match tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv()).await {
                 Ok(Some(_)) => continue, // unexpected for an invalid window
@@ -4493,9 +5745,41 @@ mod tests {
     fn paper_stream(window: u64) -> StreamController {
         StreamController {
             surface: SurfaceId::new(window),
+            input_coordinates: input_coordinates::InputCoordinates::DesktopPixels,
             stop: std::sync::Arc::new(AtomicBool::new(false)),
             finished: std::sync::Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    #[test]
+    fn stream_start_does_not_ack_options_its_live_producer_is_not_using() {
+        use input_coordinates::InputCoordinates::{DesktopPixels, NormalizedV1};
+        let mut stream = paper_stream(7);
+        let normalized = serde_json::json!({"input_coordinates": "normalized_v1"});
+        let legacy = serde_json::json!({});
+        assert_eq!(
+            stream_start_coordinates(&legacy, Some(&stream), SurfaceId::new(7)),
+            Ok(DesktopPixels)
+        );
+        assert!(stream_start_coordinates(&normalized, Some(&stream), SurfaceId::new(7)).is_err());
+        assert!(stream_start_coordinates(&legacy, Some(&stream), SurfaceId::new(8)).is_err());
+        stream.input_coordinates = NormalizedV1;
+        assert_eq!(
+            stream_start_coordinates(&normalized, Some(&stream), SurfaceId::new(7)),
+            Ok(NormalizedV1)
+        );
+        assert!(stream_start_coordinates(&legacy, Some(&stream), SurfaceId::new(7)).is_err());
+        stream.finished.store(true, Ordering::Relaxed);
+        assert_eq!(
+            stream_start_coordinates(&legacy, Some(&stream), SurfaceId::new(8)),
+            Ok(DesktopPixels)
+        );
+        assert!(stream_start_coordinates(
+            &serde_json::json!({"input_coordinates": null}),
+            None,
+            SurfaceId::new(7)
+        )
+        .is_err());
     }
 
     #[test]
@@ -5024,6 +6308,80 @@ mod tests {
         assert!(redenied, "revoking input must re-deny");
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn normalized_pointer_is_converted_before_surface_authorization() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _lock = LOCK_STATE_LOCK.lock().unwrap();
+        let prev_lock = set_lock_cache(1, true);
+        std::env::set_var("RD_CAP_INPUT", "1");
+        let old_screen = module10::inject_linux::virtual_screen();
+        module10::inject_linux::set_virtual_screen(1920, 1080);
+        let mut s = active_session_with(share_source::DESKTOP_ID);
+        s.grant_input().unwrap();
+        let event = serde_json::json!({
+            "type": "input_event", "window": share_source::DESKTOP_ID,
+            "coordinate_space": "normalized_v1",
+            "event": {"MouseMove": {
+                "mode": "Absolute", "dx": 0, "dy": 0,
+                "abs_x": 49151, "abs_y": 49151
+            }}
+        });
+        let result = input_gate(&s, &event, now_epoch_secs());
+        s.revoke_input().unwrap();
+        let revoked = input_gate(&s, &event, now_epoch_secs());
+        module10::inject_linux::set_virtual_screen(old_screen.0, old_screen.1);
+        set_lock_cache(prev_lock.0, prev_lock.1);
+        std::env::remove_var("RD_CAP_INPUT");
+        match result
+            .expect("normalized input must be converted before the native-pixel scope check")
+        {
+            module10::message::InputControlMessage::MouseMove { abs_x, abs_y, .. } => {
+                assert_eq!((abs_x, abs_y), (1439, 809));
+            }
+            other => panic!("expected an absolute move, got {other:?}"),
+        }
+        assert!(revoked.is_err(), "normalization must not bypass revocation");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn normalized_pointer_preserves_scope_and_lock_denials() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _lock = LOCK_STATE_LOCK.lock().unwrap();
+        let old_screen = module10::inject_linux::virtual_screen();
+        module10::inject_linux::set_virtual_screen(1920, 1080);
+        let prev_lock = set_lock_cache(1, true);
+        let mut s = active_session_with(share_source::DESKTOP_ID);
+        let event = serde_json::json!({
+            "type": "input_event", "window": share_source::DESKTOP_ID,
+            "coordinate_space": "normalized_v1",
+            "event": {"MouseMove": {"mode": "Absolute", "dx": 0, "dy": 0, "abs_x": 32768, "abs_y": 32768}}
+        });
+        std::env::remove_var("RD_CAP_INPUT");
+        let no_capability = input_gate(&s, &event, now_epoch_secs());
+        std::env::set_var("RD_CAP_INPUT", "1");
+        let view_only = input_gate(&s, &event, now_epoch_secs());
+        s.grant_input().unwrap();
+        let allowed = input_gate(&s, &event, now_epoch_secs());
+        let mut wrong_surface = event.clone();
+        wrong_surface["window"] = serde_json::json!(7);
+        let outside_scope = input_gate(&s, &wrong_surface, now_epoch_secs());
+        set_lock_cache(2, true);
+        let locked = input_gate(&s, &event, now_epoch_secs());
+        set_lock_cache(0, true);
+        let unknown_lock = input_gate(&s, &event, now_epoch_secs());
+        set_lock_cache(prev_lock.0, prev_lock.1);
+        module10::inject_linux::set_virtual_screen(old_screen.0, old_screen.1);
+        std::env::remove_var("RD_CAP_INPUT");
+        assert!(no_capability.is_err());
+        assert!(view_only.is_err());
+        assert!(allowed.is_ok(), "{allowed:?}");
+        assert!(outside_scope.is_err());
+        assert!(locked.is_err());
+        assert!(unknown_lock.is_err());
+    }
+
     /// An absolute move must be refused whenever the permitted window's
     /// geometry cannot be established, because there is then nothing to clamp
     /// it against.
@@ -5235,7 +6593,12 @@ mod tests {
         // Window 0 is never a valid HWND/desktop id on either platform, so
         // capture fails on the very first frame — deterministic, no display
         // required.
-        let ctl = StreamController::start(75, tx, SurfaceId::new(0));
+        let ctl = StreamController::start(
+            75,
+            tx,
+            SurfaceId::new(0),
+            input_coordinates::InputCoordinates::DesktopPixels,
+        );
 
         // Drain until the channel closes (producer thread exits) or we see the
         // client-facing error message the fix now sends.
@@ -5460,8 +6823,9 @@ mod tests {
 
         // THE ONE THAT ACTUALLY SHIPS, and the one this test did not read until
         // 2026-09-05. run.sh and run.bat are DEVELOPMENT launchers. The .deb
-        // installs packaging/linux/remotedexter-launcher as /usr/bin/remotedexter
-        // and the .desktop file's Exec=remotedexter runs it, so it is what every
+        // installs packaging/linux/remotedexter-launcher as
+        // /opt/baxters/remotedexter/run.sh, the desktop entry's Exec, and links
+        // /usr/bin/remotedexter to it, so it is what every
         // user who clicks the icon gets.
         //
         // It granted NOTHING. Deny-by-default meant the packaged product could
@@ -5664,6 +7028,492 @@ set RD_CAP_SCREENSHOT=1
     /// no amount of unit testing can reach: without a real injector nothing is
     /// ever held, so the whole property is vacuous off hardware.
     ///
+    /// RD-TEXT-1: paragraph-sized text runs, typed in paced batches.
+    ///
+    /// **Nothing in this module reaches a real injector.** The ordering tests
+    /// drive `run_text_plan` with a recording closure; the end-to-end tests go
+    /// through `handle_input_scoped` only on paths that are refused before the
+    /// first keystroke. A text run that SUCCEEDED here would type into whatever
+    /// desktop the test runs on — on the dev box, the operator's live session.
+    mod text_runs {
+        use super::*;
+        use module10::keymap::{text_to_messages, text_to_plan, TextPlan};
+        use std::cell::{Cell, RefCell};
+
+        const PARA: &str = "Several sentences of ordinary text, long enough to need many \
+batches. It has Capitals, digits like 2026 and 42, and punctuation: commas, colons; quotes \
+\"like this\" and a question? Yes. It ends without an Enter.";
+
+        fn ready() -> std::future::Ready<()> {
+            std::future::ready(())
+        }
+
+        /// Laid end to end, the injected events are exactly the unbatched
+        /// expansion; the run pauses and re-asks authority BETWEEN batches,
+        /// never before the first.
+        #[tokio::test]
+        async fn a_run_injects_every_event_in_order_pausing_between_batches() {
+            let plan = text_to_plan(PARA).unwrap();
+            let batches = plan.batches().len();
+            assert!(
+                batches > 3,
+                "the fixture must span several batches, spans {batches}"
+            );
+            let seen = RefCell::new(Vec::new());
+            let pauses = Cell::new(0);
+            let checks = Cell::new(0);
+            let end = run_text_plan(
+                &plan,
+                |m| {
+                    seen.borrow_mut().push(m.clone());
+                    Ok(1)
+                },
+                || {
+                    checks.set(checks.get() + 1);
+                    Ok(())
+                },
+                || {
+                    pauses.set(pauses.get() + 1);
+                    ready()
+                },
+            )
+            .await;
+            let expected = text_to_messages(PARA).unwrap();
+            assert_eq!(
+                end,
+                TextRunEnd::Complete {
+                    injected: expected.len() as u32
+                }
+            );
+            assert_eq!(*seen.borrow(), expected);
+            assert_eq!(pauses.get(), batches - 1);
+            assert_eq!(checks.get(), batches - 1);
+        }
+
+        /// The safety property: once authority is gone — revoked, expired, or
+        /// the desktop locked — not one more keystroke goes in.
+        #[tokio::test]
+        async fn a_run_stops_at_the_first_batch_boundary_after_authority_ends() {
+            let plan = text_to_plan(PARA).unwrap();
+            let seen = RefCell::new(0usize);
+            let checks = Cell::new(0);
+            let end = run_text_plan(
+                &plan,
+                |_| {
+                    *seen.borrow_mut() += 1;
+                    Ok(1)
+                },
+                || {
+                    checks.set(checks.get() + 1);
+                    // Allowed before batch 2, refused before batch 3.
+                    if checks.get() < 2 {
+                        Ok(())
+                    } else {
+                        Err(json_denied("input_event", "host desktop is locked"))
+                    }
+                },
+                ready,
+            )
+            .await;
+            let sizes: Vec<usize> = plan.batches().iter().map(|b| b.len()).collect();
+            let two_batches = sizes[0] + sizes[1];
+            assert_eq!(
+                *seen.borrow(),
+                two_batches * 2,
+                "a down and an up per keystroke"
+            );
+            assert_eq!(
+                end,
+                TextRunEnd::Withdrawn {
+                    typed: plan.keys[two_batches - 1].chars_through,
+                    injected: (two_batches * 2) as u32,
+                    refusal: json_denied("input_event", "host desktop is locked"),
+                }
+            );
+        }
+
+        /// A failed PRESS has not typed its character; a failed RELEASE has.
+        /// Either way nothing after the failure is attempted.
+        #[tokio::test]
+        async fn a_fault_stops_the_run_and_counts_what_landed() {
+            let plan = text_to_plan(PARA).unwrap();
+            // Event index 20 is the 11th key's press; 21 is its release.
+            for (fail_at, typed_key) in [(20usize, 9usize), (21, 10)] {
+                let n = Cell::new(0usize);
+                let end = run_text_plan(
+                    &plan,
+                    |_| {
+                        let i = n.get();
+                        n.set(i + 1);
+                        if i == fail_at {
+                            Err(InjectFault::Failed)
+                        } else {
+                            Ok(1)
+                        }
+                    },
+                    || Ok(()),
+                    ready,
+                )
+                .await;
+                assert_eq!(
+                    n.get(),
+                    fail_at + 1,
+                    "nothing may be attempted after a failure"
+                );
+                assert_eq!(
+                    end,
+                    TextRunEnd::Faulted {
+                        typed: plan.keys[typed_key].chars_through,
+                        injected: fail_at as u32,
+                        fault: InjectFault::Failed,
+                    }
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn an_empty_run_completes_without_pausing() {
+            let plan = TextPlan {
+                keys: Vec::new(),
+                total_chars: 0,
+            };
+            let end = run_text_plan(
+                &plan,
+                |_| panic!("nothing to inject"),
+                || panic!("no batch boundary to check at"),
+                || -> std::future::Ready<()> { panic!("no batch boundary to pause at") },
+            )
+            .await;
+            assert_eq!(end, TextRunEnd::Complete { injected: 0 });
+        }
+
+        #[test]
+        fn only_a_text_commands_numeric_id_is_honoured() {
+            let text = serde_json::json!({"type":"input_event","window":1,"text_id":7,
+                "event":{"TextInput":{"text":"hi"}}});
+            let mv = serde_json::json!({"type":"input_event","window":1,"text_id":7,
+                "event":{"MouseMove":{"mode":"Relative","dx":1,"dy":0,"abs_x":0,"abs_y":0}}});
+            let stringy = serde_json::json!({"type":"input_event","window":1,"text_id":"7",
+                "event":{"TextInput":{"text":"hi"}}});
+            let negative = serde_json::json!({"type":"input_event","window":1,"text_id":-1,
+                "event":{"TextInput":{"text":"hi"}}});
+            assert_eq!(text_id_of(&text), Some(7));
+            assert_eq!(text_id_of(&mv), None);
+            assert_eq!(text_id_of(&stringy), None);
+            assert_eq!(text_id_of(&negative), None);
+        }
+
+        /// Backwards compatibility: a client that sent no id gets the reply it
+        /// always got, byte for byte.
+        #[test]
+        fn a_reply_without_a_text_id_is_unchanged() {
+            let r = json_err("input_event", "unsupported_character");
+            assert_eq!(tag_text_reply(r.clone(), None, 5, &[("at", 3.into())]), r);
+        }
+
+        #[test]
+        fn a_tagged_reply_carries_the_id_the_count_and_the_specifics() {
+            let r = tag_text_reply(
+                json_err("input_event", "unsupported_character"),
+                Some(9),
+                0,
+                &[("at", 1900.into())],
+            );
+            let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+            assert_eq!(v["type"], "error");
+            assert_eq!(v["for"], "input_event");
+            assert_eq!(v["reason"], "unsupported_character");
+            assert_eq!(v["text_id"], 9);
+            assert_eq!(v["typed"], 0);
+            assert_eq!(v["at"], 1900);
+        }
+
+        fn text_cmd(text: &str, id: Option<u64>) -> serde_json::Value {
+            let mut c = serde_json::json!({"type":"input_event","window":42,
+                "event":{"TextInput":{"text":text}}});
+            if let Some(id) = id {
+                c["text_id"] = id.into();
+            }
+            c
+        }
+
+        fn parse(reply: Option<String>) -> serde_json::Value {
+            serde_json::from_str(&reply.expect("a text command always gets a reply")).unwrap()
+        }
+
+        /// Through the real handler, on every path that refuses BEFORE the
+        /// first keystroke: an untypable character late in a paragraph, a run
+        /// over the ceiling, and a peer without the grant. Each says what
+        /// happened to the text — nothing typed — under the phone's id.
+        #[tokio::test]
+        async fn refusals_before_the_first_keystroke_report_nothing_typed() {
+            let _e = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let _g = LOCK_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            std::env::set_var("RD_CAP_INPUT", "1");
+            let prev = set_lock_cache(1, true);
+            let now = now_epoch_secs();
+            let mut granted = active_session_with(42);
+            granted.grant_input().unwrap();
+            let mut view_only = active_session_with(42);
+
+            let late_bad = format!("{}\u{e9}", "a".repeat(1500));
+            let bad = handle_input_scoped(&mut granted, &text_cmd(&late_bad, Some(3)), now).await;
+            let long = "a".repeat(module10::keymap::MAX_TEXT_CHARS + 1);
+            let too_long = handle_input_scoped(&mut granted, &text_cmd(&long, Some(4)), now).await;
+            let gated = handle_input_scoped(&mut view_only, &text_cmd("hello", Some(5)), now).await;
+            let legacy = handle_input_scoped(&mut granted, &text_cmd(&late_bad, None), now).await;
+
+            set_lock_cache(prev.0, prev.1);
+            std::env::remove_var("RD_CAP_INPUT");
+            drop(_g);
+            drop(_e);
+
+            let bad = parse(bad);
+            assert_eq!(bad["reason"], "unsupported_character");
+            assert_eq!(
+                (bad["text_id"].as_u64(), bad["typed"].as_u64()),
+                (Some(3), Some(0))
+            );
+            assert_eq!(
+                bad["at"], 1500,
+                "the position, so the phone can name the character"
+            );
+
+            let too_long = parse(too_long);
+            assert_eq!(too_long["reason"], "text_too_long");
+            assert_eq!(too_long["text_id"], 4);
+            assert_eq!(too_long["max"], module10::keymap::MAX_TEXT_CHARS);
+
+            let gated = parse(gated);
+            assert_eq!(gated["type"], "denied");
+            assert_eq!(
+                (gated["text_id"].as_u64(), gated["typed"].as_u64()),
+                (Some(5), Some(0))
+            );
+
+            assert_eq!(
+                legacy.as_deref(),
+                Some(json_err("input_event", "unsupported_character").as_str()),
+                "a client that sent no id must get the old reply exactly"
+            );
+
+            // The phone keeps the grant on exactly these reasons, read from the
+            // shared contract. A reason renamed here would silently turn a
+            // text refusal back into "Viewing Only" on the phone.
+            let path = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../contract/android_input_wire_v1.json"
+            );
+            let fixture: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            let mut listed: Vec<&str> = fixture["limits"]["text_content_refusals"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            listed.sort_unstable();
+            let mut emitted = vec![
+                bad["reason"].as_str().unwrap(),
+                too_long["reason"].as_str().unwrap(),
+            ];
+            emitted.sort_unstable();
+            assert_eq!(listed, emitted);
+        }
+
+        /// A text command as the phone sends it, on the desktop surface (whose
+        /// id, `i64::MAX`, is the longest a window can be).
+        fn text_command(text: &str, id: u64) -> String {
+            serde_json::json!({"type":"input_event","window":i64::MAX,"text_id":id,
+                "event":{"TextInput":{"text":text}}})
+            .to_string()
+        }
+
+        /// A text command of exactly `total` bytes that is still UNDER the
+        /// character ceiling: built of quotes, which JSON escapes to two bytes
+        /// each. This is the case only a byte check can catch.
+        fn command_of_exactly(total: usize, id: u64) -> String {
+            let base = text_command("", id).len();
+            let need = total - base;
+            let text = format!("{}{}", "\"".repeat(need / 2), "a".repeat(need % 2));
+            assert!(text.chars().count() <= module10::keymap::MAX_TEXT_CHARS);
+            let cmd = text_command(&text, id);
+            assert_eq!(cmd.len(), total);
+            cmd
+        }
+
+        /// The phone measures its encoded command against the envelope the
+        /// shipping client frames input in — `InputV1`, 4 KiB — because the
+        /// client's native loop DROPS a command that will not fit, after
+        /// `sendCommand` has already said yes. The fixture states the number;
+        /// this is the side that knows the real one.
+        ///
+        /// Ordinary prose at the character ceiling fits with room to spare. A
+        /// command one byte over does not, while still being under 2,000
+        /// characters — which is why the character ceiling alone is not enough.
+        #[test]
+        fn the_phones_byte_ceiling_is_the_input_envelope() {
+            let path = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../contract/android_input_wire_v1.json"
+            );
+            let fixture: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            let limits = &fixture["limits"];
+            let envelope = wire::Kind::InputV1.max_payload();
+            assert_eq!(
+                limits["input_v1_max_payload"].as_u64(),
+                Some(envelope as u64)
+            );
+            assert_eq!(
+                limits["max_text_chars"].as_u64(),
+                Some(module10::keymap::MAX_TEXT_CHARS as u64)
+            );
+
+            let prose: String = PARA
+                .chars()
+                .cycle()
+                .take(module10::keymap::MAX_TEXT_CHARS)
+                .collect();
+            let cmd = text_command(&prose, i64::MAX as u64);
+            assert!(
+                cmd.len() < envelope * 3 / 4,
+                "2,000 characters of prose is {} bytes; the input envelope holds {envelope}",
+                cmd.len()
+            );
+            let input = |c: String| wire::Envelope::new(wire::Kind::InputV1, 0, c.into_bytes());
+            assert!(input(cmd).is_ok());
+            assert!(input(command_of_exactly(envelope, 1)).is_ok());
+            assert!(
+                input(command_of_exactly(envelope + 1, 1)).is_err(),
+                "one byte over the input envelope was framed; the phone's byte check guards nothing"
+            );
+        }
+
+        /// The SHIPPING client carries a full paragraph, and the reply comes back
+        /// through the real session loop tagged with the paragraph's id.
+        ///
+        /// Everything above calls the handler directly; this drives
+        /// `remotedexter::PinnedNoiseSession` — the type the APK runs — through
+        /// its own envelope and Noise framing into the production session loop.
+        /// Its first version sent a 12 KB worst case and the client refused
+        /// it: input rides the 4 KiB `InputV1` envelope, not the 16 KiB control
+        /// one the design had assumed. The largest command sent here is the
+        /// largest the phone will send.
+        ///
+        /// No window is permitted and nothing is granted, so the host refuses
+        /// every run before the first keystroke: nothing can be injected, on
+        /// any machine this runs on.
+        #[tokio::test]
+        async fn the_shipping_client_carries_a_paragraph_and_gets_its_reply_back() {
+            let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            reset_loopback_test_state();
+            let identity = test_host_identity();
+            let mut pairing = test_pairing_service();
+            let token = real_invite_token(&mut pairing);
+            let (addr, host, _auth) = start_loopback_host_with(&pairing).await;
+            let mut session = remotedexter::PinnedNoiseSession::connect(
+                addr.ip().to_string(),
+                addr.port(),
+                token,
+                identity.public.clone(),
+            )
+            .await
+            .expect("pinned Noise connection");
+
+            let envelope = wire::Kind::InputV1.max_payload();
+            let paragraph: String = PARA
+                .chars()
+                .cycle()
+                .take(module10::keymap::MAX_TEXT_CHARS)
+                .collect();
+            let runs = [
+                (11u64, text_command(&paragraph, 11)),
+                (12, command_of_exactly(envelope, 12)),
+            ];
+            for (id, cmd) in runs {
+                session
+                    .send_command(cmd.as_bytes())
+                    .await
+                    .unwrap_or_else(|e| panic!("the shipping client refused run {id}: {e}"));
+                let reply = tokio::time::timeout(std::time::Duration::from_secs(5), session.recv())
+                    .await
+                    .unwrap_or_else(|_| panic!("no reply to run {id}"))
+                    .expect("receive the reply");
+                let reply: serde_json::Value =
+                    serde_json::from_slice(&opened(&reply).payload).expect("reply is JSON");
+                assert_eq!(reply["for"], "input_event", "{reply}");
+                assert_eq!(reply["type"], "denied", "nothing is permitted: {reply}");
+                assert_eq!(reply["text_id"], id, "the reply lost its run's id: {reply}");
+                assert_eq!(reply["typed"], 0, "{reply}");
+            }
+
+            // One byte more — still under 2,000 characters — the client will
+            // not frame. That refusal is the phone's to make, before its field
+            // clears; here it is only confirmed, along with the session
+            // surviving it.
+            let over = command_of_exactly(envelope + 1, 13);
+            assert!(
+                session.send_command(over.as_bytes()).await.is_err(),
+                "the client framed a command over the input envelope"
+            );
+            session
+                .send_command(br#"{"type":"ping"}"#)
+                .await
+                .expect("the session must survive a refused command");
+            let pong = tokio::time::timeout(std::time::Duration::from_secs(5), session.recv())
+                .await
+                .expect("no pong after the refused command")
+                .expect("receive pong");
+            assert_eq!(opened(&pong).payload, br#"{"type":"pong"}"#);
+
+            drop(session);
+            tokio::time::timeout(std::time::Duration::from_secs(2), host)
+                .await
+                .expect("host did not finish after disconnect")
+                .expect("host task panicked")
+                .expect("host connection failed");
+        }
+
+        /// The check repeated between batches is the gate's own: a lock, a
+        /// revoked grant, or a missing capability each stops the run.
+        #[test]
+        fn the_between_batch_check_refuses_what_the_gate_refuses() {
+            let _e = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let _g = LOCK_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            std::env::set_var("RD_CAP_INPUT", "1");
+            let prev = set_lock_cache(1, true);
+            let now = now_epoch_secs();
+            let w = SurfaceId::new(42);
+            let mut s = active_session_with(42);
+            s.grant_input().unwrap();
+
+            let open = text_may_continue(&s, w, now);
+            set_lock_cache(2, true);
+            let locked = text_may_continue(&s, w, now);
+            set_lock_cache(1, true);
+            let other_surface = text_may_continue(&s, SurfaceId::new(7), now);
+            s.revoke_input().unwrap();
+            let revoked = text_may_continue(&s, w, now);
+            s.grant_input().unwrap();
+            std::env::remove_var("RD_CAP_INPUT");
+            let no_capability = text_may_continue(&s, w, now);
+
+            set_lock_cache(prev.0, prev.1);
+            drop(_g);
+            drop(_e);
+
+            assert_eq!(open, Ok(()));
+            assert_eq!(
+                locked,
+                Err(json_denied("input_event", "host desktop is locked"))
+            );
+            assert!(other_surface.is_err());
+            assert!(revoked.is_err());
+            assert!(no_capability.is_err());
+        }
+    }
+
     /// Serialised: the injector is process-global and these press and release
     /// it. Run in BaxtersVMHarness — Article XIV forbids this box's live seat.
     // Linux AND Windows. Every call below goes through `module10::inject`,
@@ -6410,6 +8260,80 @@ set RD_CAP_SCREENSHOT=1
     #[test]
     fn the_granting_value_is_not_flagged() {
         assert!(!capability_value_is_malformed("1"));
+    }
+
+    /// The icon sets no variables, so before stored settings the packaged host
+    /// could only ever capture. A stored grant must be enough on its own.
+    #[test]
+    fn a_stored_grant_is_enough_without_any_variable() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // ENV_LOCK first, then the settings lock, everywhere.
+        let _a = settings::ACTIVE_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for cap in settings::Capability::ALL {
+            std::env::remove_var(cap.env_var());
+        }
+        settings::set_active(settings::Settings::default());
+        assert!(
+            !capability_granted("input_event"),
+            "deny-by-default with no file and no variable"
+        );
+
+        let mut stored = settings::Settings::default();
+        stored
+            .capabilities
+            .input
+            .allow("2026-09-15T10:03:00Z".into());
+        settings::set_active(stored);
+        assert!(
+            capability_granted("input_event"),
+            "a stored grant must reach the session loop"
+        );
+        assert!(
+            !capability_granted("clipboard"),
+            "a stored input grant must not carry the clipboard with it"
+        );
+        assert!(
+            !capability_granted("screenshot_request"),
+            "nor screen capture"
+        );
+
+        settings::set_active(settings::Settings::default());
+        assert!(
+            !capability_granted("input_event"),
+            "a revoked grant must stop granting at once"
+        );
+    }
+
+    /// A stored grant and a malformed variable are different things, and the
+    /// malformed one still grants nothing.
+    #[test]
+    fn a_malformed_variable_neither_grants_nor_cancels_what_is_stored() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // ENV_LOCK first, then the settings lock, everywhere.
+        let _a = settings::ACTIVE_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        settings::set_active(settings::Settings::default());
+        std::env::set_var("RD_CAP_CLIPBOARD", "1 ");
+        assert!(
+            !capability_granted("clipboard"),
+            "a trailing space must not grant"
+        );
+
+        let mut stored = settings::Settings::default();
+        stored
+            .capabilities
+            .clipboard
+            .allow("2026-09-15T10:03:00Z".into());
+        settings::set_active(stored);
+        assert!(
+            capability_granted("clipboard"),
+            "a malformed variable must not cancel the owner's stored grant"
+        );
+        std::env::remove_var("RD_CAP_CLIPBOARD");
+        settings::set_active(settings::Settings::default());
     }
 
     /// The gate itself is unchanged and still exact. Trimming would loosen a

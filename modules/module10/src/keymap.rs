@@ -58,14 +58,81 @@ pub enum TextError {
     },
 }
 
-/// Largest text run accepted in one message.
+/// Largest text run accepted in one message: a paragraph.
 ///
-/// Bounded because each character becomes up to four kernel events, and this
-/// path is remote input injection: an unbounded string is an unbounded burst
-/// into the host's input stack from whatever is on the other end of the socket.
-/// 256 is far more than a person types in one go and small enough that the
-/// worst case is unremarkable.
-pub const MAX_TEXT_CHARS: usize = 256;
+/// It was 256, "far more than a person types in one go" — which held for a
+/// command line and failed for the thing the operator actually composes on a
+/// phone. Their report (RD-TEXT-1): typing stops at about two sentences.
+/// 2,000 characters is a long paragraph, roughly 300 words.
+///
+/// Still bounded, for two reasons that have not changed:
+///
+/// * This is remote input injection. An unbounded string is an unbounded burst
+///   into the host's input stack from whatever is on the other end of the
+///   socket, so the run is also typed in paced batches
+///   ([`TEXT_BATCH_EVENTS`]), never in one burst.
+/// * It has to fit one INPUT message. The shipping client frames every
+///   `input_event` as `wire::Kind::InputV1`, at most 4 KiB — deliberately the
+///   tightest envelope on the link. Ordinary prose of 2,000 characters encodes
+///   to about 2.1 KB. Text dense with characters JSON escapes (quotes,
+///   backslashes, slashes, line breaks: two bytes each) or with multi-byte
+///   characters can pass 4 KiB under this count, so the phone ALSO measures
+///   the encoded command and refuses an over-size one itself, before its
+///   compose field clears: the client's native loop drops an unframeable
+///   command after `sendCommand` has already said yes. Both limits are pinned
+///   in the shared contract and asserted on each side.
+///
+/// The phone enforces the same number, counted the same way (Unicode scalar
+/// values, Enter included), so this refusal is only ever reached by a client
+/// that does not.
+pub const MAX_TEXT_CHARS: usize = 2000;
+
+/// Kernel events injected per batch of a text run, at most, before the host
+/// yields.
+///
+/// A paragraph is thousands of kernel events, and the reader on the other side
+/// of `/dev/uinput` — the compositor's libinput — gets its own **64-event**
+/// evdev buffer per device (`EVDEV_MIN_BUFFER_SIZE`; a keyboard's packet hint
+/// is too small to raise it). One slot is the ring's gap, so 63 usable. If the
+/// writer gets that far ahead the kernel discards the backlog and reports
+/// `SYN_DROPPED`: characters vanish from the middle of the text with nothing
+/// on either end saying so. Measured in BaxtersVMHarness on 2026-11-17: the
+/// same 2,000-character paragraph in one burst delivered 574 to 1,778 of its
+/// 4,274 key events to a reader polling every 200 µs.
+///
+/// **Twenty, so THREE batches fit (60 of 63).** The first design sized a batch
+/// to fill the buffer — seven shifted keystrokes, 56 events — and the VM showed
+/// why that is not enough: a reader that misses a single pause has two batches
+/// waiting, 112 events, and two runs in three lost one. At twenty the reader
+/// may miss two consecutive pauses and lose nothing. Batches are cut by event
+/// cost ([`kernel_events`]), not keystroke count, so ordinary lower-case text
+/// is not paced as if every key were shifted. Pinned by
+/// `three_batches_fit_the_evdev_buffer` here and, on a real kernel, by
+/// `live_text_batches_fit_the_readers_evdev_buffer`.
+pub const TEXT_BATCH_EVENTS: usize = 20;
+
+/// The kernel's per-reader evdev buffer, in events, for a uinput keyboard.
+/// One slot of the ring is always empty, so what is waiting must stay below
+/// this.
+pub const EVDEV_READER_BUFFER_EVENTS: usize = 64;
+
+/// Kernel events one keystroke becomes on Linux: `inject_linux` emits each
+/// modifier and the key in its own frame, each ending in `SYN_REPORT` — so
+/// `(1 + modifiers) * 2` for the press and the same for the release. Four for
+/// a plain key, eight with Shift.
+pub fn kernel_events(key: &TypedKey) -> usize {
+    use crate::message::InputControlMessage;
+    [&key.down, &key.up]
+        .iter()
+        .map(|m| match m {
+            InputControlMessage::KeyEvent { modifiers, .. } => {
+                (1 + modifiers.count_ones() as usize) * 2
+            }
+            // A plan is built only of key events; anything else costs a frame.
+            _ => 2,
+        })
+        .sum()
+}
 
 /// Shift held. Set 1 code for Left Shift.
 pub const SCAN_LEFT_SHIFT: u16 = 0x2A;
@@ -194,6 +261,17 @@ fn letter_scan(ch: char) -> u16 {
 /// password left in the host's input field is worse than nothing happening, and
 /// the operator can see that nothing happened.
 pub fn text_to_keystrokes(text: &str) -> Result<Vec<Keystroke>, TextError> {
+    Ok(plan_keystrokes(text)?.into_iter().map(|(k, _)| k).collect())
+}
+
+/// Each keystroke with how many characters of `text` are consumed once it has
+/// been struck — the one place the run is validated, so every caller gets the
+/// same all-or-nothing answer.
+///
+/// The count is of the SOURCE text, not of keystrokes: a skipped `\r` is
+/// consumed too. That is what lets a run stopped part-way say exactly where it
+/// stopped in the text the operator wrote.
+fn plan_keystrokes(text: &str) -> Result<Vec<(Keystroke, usize)>, TextError> {
     let len = text.chars().count();
     if len > MAX_TEXT_CHARS {
         return Err(TextError::TooLong {
@@ -210,11 +288,89 @@ pub fn text_to_keystrokes(text: &str) -> Result<Vec<Keystroke>, TextError> {
             continue;
         }
         match char_to_key(ch) {
-            Some(k) => out.push(k),
+            Some(k) => out.push((k, at + 1)),
             None => return Err(TextError::Unsupported { ch, at }),
         }
     }
     Ok(out)
+}
+
+/// One keystroke of a text run, ready to inject: the press, the release, and
+/// how far into the source text the run has got once both have landed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedKey {
+    /// The key-down, carrying Shift when the character needs it.
+    pub down: crate::message::InputControlMessage,
+    /// The matching key-up, carrying the same modifiers so Shift is released.
+    pub up: crate::message::InputControlMessage,
+    /// Characters of the source text consumed through this keystroke.
+    pub chars_through: usize,
+}
+
+/// A whole text run, validated, as keystrokes to be injected in batches.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextPlan {
+    /// Every keystroke, in order.
+    pub keys: Vec<TypedKey>,
+    /// Characters in the source text. A run that finishes has consumed all of
+    /// them, including any trailing `\r` that produced no keystroke.
+    pub total_chars: usize,
+}
+
+impl TextPlan {
+    /// The keystrokes in order, cut into batches of at most
+    /// [`TEXT_BATCH_EVENTS`] kernel events. Greedy: a batch takes keystrokes
+    /// until the next would not fit. A keystroke is never split across
+    /// batches, so a pause never falls between a key's press and its release.
+    pub fn batches(&self) -> Vec<&[TypedKey]> {
+        let mut out = Vec::new();
+        let mut start = 0;
+        let mut cost = 0;
+        for (i, key) in self.keys.iter().enumerate() {
+            let k = kernel_events(key);
+            if cost + k > TEXT_BATCH_EVENTS && i > start {
+                out.push(&self.keys[start..i]);
+                start = i;
+                cost = 0;
+            }
+            cost += k;
+        }
+        if start < self.keys.len() {
+            out.push(&self.keys[start..]);
+        }
+        out
+    }
+}
+
+/// Validate a whole text run and lay it out for paced injection.
+///
+/// **Validation is complete before anything is returned.** An unsupported
+/// character at position 1,900 refuses the run exactly as one at position 0
+/// does, so batching can never type a prefix and then discover the problem.
+/// What the batches buy is pacing, not a weaker rule.
+pub fn text_to_plan(text: &str) -> Result<TextPlan, TextError> {
+    use crate::message::{InputControlMessage, KeyAction, MOD_SHIFT};
+    let total_chars = text.chars().count();
+    let keys = plan_keystrokes(text)?
+        .into_iter()
+        .map(|(k, chars_through)| {
+            let modifiers = if k.shift { MOD_SHIFT } else { 0 };
+            TypedKey {
+                down: InputControlMessage::KeyEvent {
+                    scan_code: k.scan_code,
+                    action: KeyAction::Down,
+                    modifiers,
+                },
+                up: InputControlMessage::KeyEvent {
+                    scan_code: k.scan_code,
+                    action: KeyAction::Up,
+                    modifiers,
+                },
+                chars_through,
+            }
+        })
+        .collect();
+    Ok(TextPlan { keys, total_chars })
 }
 
 /// Expand a text run into the key events that type it.
@@ -231,23 +387,11 @@ pub fn text_to_keystrokes(text: &str) -> Result<Vec<Keystroke>, TextError> {
 /// are not processed as simultaneous. Holding Shift across several keys would
 /// mean reproducing that ordering here for a saving nobody can perceive.
 pub fn text_to_messages(text: &str) -> Result<Vec<crate::message::InputControlMessage>, TextError> {
-    use crate::message::{InputControlMessage, KeyAction, MOD_SHIFT};
-    let strokes = text_to_keystrokes(text)?;
-    let mut out = Vec::with_capacity(strokes.len() * 2);
-    for k in strokes {
-        let modifiers = if k.shift { MOD_SHIFT } else { 0 };
-        out.push(InputControlMessage::KeyEvent {
-            scan_code: k.scan_code,
-            action: KeyAction::Down,
-            modifiers,
-        });
-        out.push(InputControlMessage::KeyEvent {
-            scan_code: k.scan_code,
-            action: KeyAction::Up,
-            modifiers,
-        });
-    }
-    Ok(out)
+    Ok(text_to_plan(text)?
+        .keys
+        .into_iter()
+        .flat_map(|k| [k.down, k.up])
+        .collect())
 }
 
 #[cfg(test)]
@@ -383,6 +527,240 @@ mod tests {
         // The ceiling itself is accepted, so the bound is the stated one.
         let at_max: String = "a".repeat(MAX_TEXT_CHARS);
         assert_eq!(text_to_keystrokes(&at_max).unwrap().len(), MAX_TEXT_CHARS);
+    }
+
+    /// A representative paragraph: several sentences, capitals, digits and the
+    /// punctuation people actually write. Not anyone's real text.
+    const PARAGRAPH: &str = "The quarterly backup finished at 02:14, three minutes later than \
+the night before. Two of the forty-one folders were skipped because their owners had them open; \
+both were picked up on the retry at 02:30. Disk usage on the archive volume is now 61% (up from \
+58% last week), which leaves roughly five months at the current rate. Nothing needs doing today, \
+but the oldest snapshots (those before 2024-03-01) could be pruned if space becomes tight. The \
+restore test from Tuesday passed: every file matched its checksum, and the slowest one took 9.6 \
+seconds. If anything looks wrong, check the log first - it names the folder, the time and the \
+reason - and only then rerun the job by hand. Questions can go in the usual thread; please keep \
+passwords and keys out of it, even partial ones. Thanks to everyone who kept their machines on \
+overnight; it made the difference between a clean run and a half-finished one.";
+
+    /// RD-TEXT-1. The operator's report: typing stops at about two sentences.
+    /// The ceiling was 256 characters; a paragraph must go through in one run.
+    #[test]
+    fn a_paragraph_is_accepted_in_one_run() {
+        let len = PARAGRAPH.chars().count();
+        assert!(
+            len > 256,
+            "the fixture must be longer than the old ceiling, is {len}"
+        );
+        let strokes = text_to_keystrokes(PARAGRAPH).expect("a paragraph must be typable");
+        assert_eq!(
+            strokes.len(),
+            len,
+            "one keystroke per character, nothing dropped"
+        );
+        // The old ceiling plus one, which is where the refusal used to start.
+        assert_eq!(
+            text_to_keystrokes(&"a".repeat(257)).map(|s| s.len()),
+            Ok(257)
+        );
+    }
+
+    /// The new ceiling is exactly 2,000 characters.
+    #[test]
+    fn the_ceiling_is_two_thousand_characters() {
+        assert_eq!(MAX_TEXT_CHARS, 2000);
+        assert_eq!(
+            text_to_keystrokes(&"a".repeat(2000)).map(|s| s.len()),
+            Ok(2000)
+        );
+        assert_eq!(
+            text_to_keystrokes(&"a".repeat(2001)),
+            Err(TextError::TooLong {
+                len: 2001,
+                max: 2000
+            })
+        );
+    }
+
+    fn batch_events(batch: &[TypedKey]) -> usize {
+        batch.iter().map(kernel_events).sum()
+    }
+
+    /// The cost model is `inject_linux`'s emission: a frame per modifier and
+    /// one for the key, each with its `SYN_REPORT`, for press and release.
+    #[test]
+    fn a_plain_key_is_four_kernel_events_and_a_shifted_one_eight() {
+        let plan = text_to_plan("aA").unwrap();
+        assert_eq!(kernel_events(&plan.keys[0]), 4);
+        assert_eq!(kernel_events(&plan.keys[1]), 8);
+    }
+
+    /// Batching is pacing only: laid end to end, the batches are exactly the
+    /// sequence the unbatched expansion produces — same keys, same order,
+    /// every press followed by its own release.
+    #[test]
+    fn batches_flatten_to_exactly_the_unbatched_sequence() {
+        let plan = text_to_plan(PARAGRAPH).unwrap();
+        let flat: Vec<_> = plan
+            .batches()
+            .into_iter()
+            .flat_map(|b| b.iter().flat_map(|k| [k.down.clone(), k.up.clone()]))
+            .collect();
+        assert_eq!(flat, text_to_messages(PARAGRAPH).unwrap());
+        assert!(
+            plan.batches().len() > 1,
+            "a paragraph must take more than one batch"
+        );
+    }
+
+    /// Greedy: every batch but the last is full — the next keystroke would not
+    /// have fitted. A batch smaller than it needs to be is pacing for nothing.
+    #[test]
+    fn batches_are_cut_greedily_by_event_cost() {
+        let plan = text_to_plan(PARAGRAPH).unwrap();
+        let batches = plan.batches();
+        let mut next = 0;
+        for (i, b) in batches.iter().enumerate() {
+            next += b.len();
+            assert!(
+                batch_events(b) <= TEXT_BATCH_EVENTS,
+                "batch {i} is {} events",
+                batch_events(b)
+            );
+            if i + 1 < batches.len() {
+                assert!(
+                    batch_events(b) + kernel_events(&plan.keys[next]) > TEXT_BATCH_EVENTS,
+                    "batch {i} stopped while the next keystroke still fitted"
+                );
+            }
+        }
+        assert_eq!(
+            next,
+            plan.keys.len(),
+            "every keystroke in exactly one batch"
+        );
+    }
+
+    /// The reason for twenty: THREE batches must fit the reader's buffer, so a
+    /// compositor that misses two pauses in a row still loses nothing. Worst
+    /// case is every character shifted.
+    #[test]
+    fn three_batches_fit_the_evdev_buffer() {
+        for text in [
+            PARAGRAPH.to_string(),
+            "A".repeat(MAX_TEXT_CHARS),
+            "a".repeat(MAX_TEXT_CHARS),
+        ] {
+            let plan = text_to_plan(&text).unwrap();
+            let batches = plan.batches();
+            for w in batches.windows(3) {
+                let waiting: usize = w.iter().map(|b| batch_events(b)).sum();
+                assert!(
+                    waiting < EVDEV_READER_BUFFER_EVENTS,
+                    "three batches are {waiting} events; the reader holds {}",
+                    EVDEV_READER_BUFFER_EVENTS - 1
+                );
+            }
+        }
+        // The arithmetic the doc comment states, so a change to either
+        // constant has to be argued again.
+        assert!(3 * TEXT_BATCH_EVENTS < EVDEV_READER_BUFFER_EVENTS);
+        assert!(
+            4 * 16 >= EVDEV_READER_BUFFER_EVENTS,
+            "a fourth batch must be able to overflow"
+        );
+    }
+
+    /// A batch never holds less than one keystroke, even if a single key's
+    /// events exceeded the budget — otherwise the cut would loop forever.
+    #[test]
+    fn a_batch_always_makes_progress() {
+        let plan = text_to_plan(&"A".repeat(50)).unwrap();
+        assert!(plan.batches().iter().all(|b| !b.is_empty()));
+    }
+
+    /// `chars_through` counts the SOURCE text, `\r` included, so a run that
+    /// stops part-way can say where it stopped in what the operator wrote.
+    #[test]
+    fn chars_through_counts_the_source_text_including_skipped_returns() {
+        let plan = text_to_plan("ab\r\ncd\r").unwrap();
+        let through: Vec<usize> = plan.keys.iter().map(|k| k.chars_through).collect();
+        assert_eq!(through, vec![1, 2, 4, 5, 6]);
+        assert_eq!(
+            plan.total_chars, 7,
+            "the trailing CR is consumed by a finished run"
+        );
+    }
+
+    /// Go appends one Enter; the run must type exactly that one, last. Type
+    /// appends none, and the run must type none.
+    #[test]
+    fn a_submitted_paragraph_ends_with_exactly_one_enter() {
+        const ENTER: u16 = 0x1C;
+        let is_enter = |k: &TypedKey| {
+            matches!(
+                k.down,
+                crate::message::InputControlMessage::KeyEvent {
+                    scan_code: ENTER,
+                    ..
+                }
+            )
+        };
+        let submitted = text_to_plan(&format!("{PARAGRAPH}\n")).unwrap();
+        assert_eq!(submitted.keys.iter().filter(|k| is_enter(k)).count(), 1);
+        assert!(
+            is_enter(submitted.keys.last().unwrap()),
+            "the Enter must be the final keystroke"
+        );
+
+        let staged = text_to_plan(PARAGRAPH).unwrap();
+        assert_eq!(staged.keys.iter().filter(|k| is_enter(k)).count(), 0);
+    }
+
+    /// All or nothing survives batching: a bad character near the END of a
+    /// long run refuses the whole run before a single batch exists.
+    #[test]
+    fn a_late_bad_character_refuses_the_whole_plan() {
+        let text = format!("{}\u{e9}{}", "a".repeat(1900), "b".repeat(50));
+        assert_eq!(
+            text_to_plan(&text),
+            Err(TextError::Unsupported {
+                ch: '\u{e9}',
+                at: 1900
+            })
+        );
+    }
+
+    #[test]
+    fn an_empty_run_has_no_batches() {
+        let plan = text_to_plan("").unwrap();
+        assert_eq!(plan.batches().len(), 0);
+        assert_eq!(plan.total_chars, 0);
+    }
+
+    /// The ceiling is in characters on the new limit too: 2,001 three-byte
+    /// characters are refused for LENGTH (checked before content), 2,000 for
+    /// content.
+    #[test]
+    fn the_paragraph_ceiling_counts_characters_not_bytes() {
+        assert_eq!(
+            text_to_plan(&"\u{20AC}".repeat(MAX_TEXT_CHARS + 1)),
+            Err(TextError::TooLong {
+                len: MAX_TEXT_CHARS + 1,
+                max: MAX_TEXT_CHARS
+            })
+        );
+        assert_eq!(
+            text_to_plan(&"\u{20AC}".repeat(MAX_TEXT_CHARS)),
+            Err(TextError::Unsupported {
+                ch: '\u{20AC}',
+                at: 0
+            })
+        );
+        // An astral character is one character, not two UTF-16 units.
+        assert!(matches!(
+            text_to_plan(&"\u{1F600}".repeat(MAX_TEXT_CHARS)),
+            Err(TextError::Unsupported { .. })
+        ));
     }
 
     /// The length limit counts CHARACTERS, not bytes: a multi-byte character

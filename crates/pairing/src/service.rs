@@ -22,8 +22,9 @@
 //! or any network type beyond `SocketAddr` itself.
 
 use crate::invite::{
-    addr_string, canonical_bytes, nonce_hex, relay_canonical_bytes, RelayInvite, SignedInvite,
-    INVITE_KIND, INVITE_VERSION, RELAY_INVITE_VERSION, SESSION_PROTOCOL,
+    addr_string, canonical_bytes, dual_canonical_bytes, nonce_hex, relay_canonical_bytes,
+    DualInvite, RelayInvite, SignedInvite, DUAL_INVITE_VERSION, INVITE_KIND, INVITE_VERSION,
+    RELAY_INVITE_VERSION, SESSION_PROTOCOL,
 };
 use crate::qr::{self, QrBitmap};
 use crate::token::{RedeemError, RedemptionHandle, Token, TOKEN_TTL};
@@ -61,6 +62,16 @@ pub struct Invitation {
 pub struct RelayInvitation {
     /// The signed invite. Its `token` field is the credential.
     pub invite: RelayInvite,
+    /// In-memory QR bitmap. Never written to disk.
+    pub qr: QrBitmap,
+    /// Short non-secret handle for log correlation.
+    pub token_fingerprint: String,
+}
+
+/// A freshly minted invitation for a host serving both routes.
+pub struct DualInvitation {
+    /// The signed invite. Its `token` field is the credential.
+    pub invite: DualInvite,
     /// In-memory QR bitmap. Never written to disk.
     pub qr: QrBitmap,
     /// Short non-secret handle for log correlation.
@@ -256,6 +267,84 @@ impl PairingService {
         self.tokens.issue(&token, expires_at);
 
         Ok(RelayInvitation {
+            invite,
+            qr,
+            token_fingerprint,
+        })
+    }
+
+    /// Mint one invitation naming BOTH routes this host is serving: the address
+    /// it is bound to, and the relay and session it dialled.
+    ///
+    /// Every rule of [`PairingService::create_invite`] and
+    /// [`PairingService::create_relay_invite`] applies to its half, and there is
+    /// still ONE outstanding token — a phone uses it on whichever route wins.
+    pub fn create_dual_invite(
+        &mut self,
+        bind: SocketAddr,
+        relay: SocketAddr,
+        session: &str,
+        now: u64,
+        capabilities: &[String],
+    ) -> Result<DualInvitation, MintError> {
+        for addr in [bind, relay] {
+            if addr.ip().is_unspecified() {
+                return Err(MintError::UnusableAddress("a wildcard address"));
+            }
+            if addr.port() == 0 {
+                return Err(MintError::UnusableAddress("port 0"));
+            }
+        }
+        if session.is_empty() {
+            return Err(MintError::UnusableAddress("an empty session id"));
+        }
+
+        let token = Token::generate();
+        let nonce = nonce_hex();
+        let addr = addr_string(bind);
+        let relay_addr = addr_string(relay);
+        let expires_at = now + TOKEN_TTL.as_secs();
+
+        let canonical = dual_canonical_bytes(
+            INVITE_KIND,
+            DUAL_INVITE_VERSION,
+            SESSION_PROTOCOL,
+            &addr,
+            bind.port(),
+            &relay_addr,
+            relay.port(),
+            session,
+            token.expose(),
+            &nonce,
+            expires_at,
+            capabilities,
+            &self.host_pubkey_hex,
+        );
+        let signature = STANDARD.encode(self.signing.sign(&canonical).to_bytes());
+
+        let invite = DualInvite {
+            kind: INVITE_KIND.to_string(),
+            version: DUAL_INVITE_VERSION,
+            protocol: SESSION_PROTOCOL.to_string(),
+            addr,
+            port: bind.port(),
+            relay_addr,
+            relay_port: relay.port(),
+            session: session.to_string(),
+            token: token.expose().to_string(),
+            nonce,
+            expires_at,
+            capabilities: capabilities.to_vec(),
+            host_pubkey: self.host_pubkey_hex.clone(),
+            host_identity_pubkey: self.identity_b64(),
+            signature,
+        };
+
+        let qr = qr::encode(&invite.to_json()).map_err(MintError::QrTooLarge)?;
+        let token_fingerprint = token.digest().fingerprint();
+        self.tokens.issue(&token, expires_at);
+
+        Ok(DualInvitation {
             invite,
             qr,
             token_fingerprint,
@@ -593,6 +682,92 @@ mod tests {
                 &widened.signature
             ),
             "a view-only relay invite was widened to control without breaking the signature"
+        );
+    }
+
+    /// **A both-routes invite names both routes exactly, and verifies.**
+    #[test]
+    fn a_dual_invite_names_both_routes_and_verifies() {
+        let mut s = svc();
+        let inv = s
+            .create_dual_invite(
+                sa("192.168.1.20:8082"),
+                sa("203.0.113.9:9443"),
+                "AAAAAAAAAAAAAAAAAAAAAA",
+                1000,
+                &caps(),
+            )
+            .unwrap();
+        let i = &inv.invite;
+        assert_eq!(i.version, DUAL_INVITE_VERSION);
+        assert_eq!((i.addr.as_str(), i.port), ("192.168.1.20", 8082));
+        assert_eq!((i.relay_addr.as_str(), i.relay_port), ("203.0.113.9", 9443));
+        assert_eq!(i.session, "AAAAAAAAAAAAAAAAAAAAAA");
+        assert!(signature_is_valid(
+            &i.canonical_bytes(),
+            &i.host_identity_pubkey,
+            &i.signature
+        ));
+        // It decodes back as a v6, not as either single route.
+        assert!(matches!(
+            crate::invite::decode(&i.to_json()),
+            Ok(crate::invite::Decoded::V6(_))
+        ));
+    }
+
+    /// Neither route may be a wildcard or port 0, and the session may not be
+    /// empty — each rule of the single-route mints, applied to its half.
+    #[test]
+    fn a_dual_invite_refuses_an_unusable_route_on_either_side() {
+        let mut s = svc();
+        let (lan, relay, sess) = (
+            sa("192.168.1.20:8082"),
+            sa("203.0.113.9:9443"),
+            "AAAAAAAAAAAAAAAAAAAAAA",
+        );
+        for (bind, rel, session) in [
+            (sa("0.0.0.0:8082"), relay, sess),
+            (sa("192.168.1.20:0"), relay, sess),
+            (lan, sa("0.0.0.0:9443"), sess),
+            (lan, sa("203.0.113.9:0"), sess),
+            (lan, relay, ""),
+        ] {
+            assert!(
+                matches!(
+                    s.create_dual_invite(bind, rel, session, 1000, &caps()),
+                    Err(MintError::UnusableAddress(_))
+                ),
+                "minted a dual invite for {bind} / {rel} / {session:?}"
+            );
+        }
+    }
+
+    /// **One token for both routes, and minting replaces whatever was out.**
+    /// Two live tokens — one per route — would mean a revocation that left the
+    /// other usable. The token redeems once, whichever route presents it.
+    #[test]
+    fn a_dual_invite_has_one_token_that_redeems_once_and_replaces_the_last() {
+        let mut s = svc();
+        let older = s
+            .create_invite(sa("192.168.1.20:8082"), 1000, &caps())
+            .unwrap();
+        let dual = s
+            .create_dual_invite(
+                sa("192.168.1.20:8082"),
+                sa("203.0.113.9:9443"),
+                "AAAAAAAAAAAAAAAAAAAAAA",
+                1000,
+                &caps(),
+            )
+            .unwrap();
+        assert!(
+            s.redeem(&older.invite.token, 1001).is_err(),
+            "minting a dual invite left the previous token redeemable"
+        );
+        assert!(s.redeem(&dual.invite.token, 1001).is_ok());
+        assert!(
+            s.redeem(&dual.invite.token, 1002).is_err(),
+            "the dual invite's token redeemed twice — once per route"
         );
     }
 }

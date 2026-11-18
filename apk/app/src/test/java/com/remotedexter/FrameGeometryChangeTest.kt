@@ -85,4 +85,26 @@ class FrameGeometryChangeTest {
             FrameGeometryChange.message(1920 to 1080, 1280 to 720, 5) != null
         )
     }
+
+    /**
+     * The lower ladder rung changes the host's DECLARED size mid-stream: a
+     * full-resolution keyframe, then a downscaled one at the same aspect, and
+     * back when the link recovers. The phone keeps no frame code special to
+     * this — it relies on every stage noticing the size change so the renderer
+     * re-sizes and the move is diagnosable. The climb back must be noticed too,
+     * or a recovered link would keep drawing the small frame stretched up;
+     * staying on a rung must stay silent, or every frame would churn the log.
+     */
+    @Test
+    fun aDownscaleRungTransitionIsReportedAtEveryStage() {
+        val full = 1920 to 1080
+        val small = 960 to 540 // the 50% rung: same 16:9, a quarter of the pixels
+        assertTrue("drop to the rung — declared", FrameGeometryChange.message(full, small, 10) != null)
+        assertTrue("drop to the rung — decoded", FrameGeometryChange.decodedMessage(full, small, 10) != null)
+        assertTrue("drop to the rung — rendered", FrameGeometryChange.renderedMessage(full, small) != null)
+        assertTrue("climb back — declared", FrameGeometryChange.message(small, full, 20) != null)
+        assertTrue("climb back — rendered", FrameGeometryChange.renderedMessage(small, full) != null)
+        assertNull("staying on the rung is not a change", FrameGeometryChange.message(small, small, 21))
+        assertNull("staying on the rung is not a change", FrameGeometryChange.renderedMessage(small, small))
+    }
 }

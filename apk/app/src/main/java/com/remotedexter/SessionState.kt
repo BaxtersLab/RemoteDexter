@@ -91,7 +91,18 @@ enum class FailureReason {
     Authorization,
 
     /** The frame stream stopped or could not be decoded. */
-    Stream;
+    Stream,
+
+    /**
+     * The relay did not know the session this device presented.
+     *
+     * The relay gives this one answer for a host that is not connected to it
+     * and for an id it no longer recognises after its own restart — on purpose,
+     * so a stranger cannot probe which ids are real. So the detail names both
+     * remedies. Reported as a stream failure before this existed, which was
+     * false: nothing had streamed.
+     */
+    RelaySessionUnknown;
 
     /** A short, user-facing label. Names what happened, not what to do about it. */
     fun label(): String = when (this) {
@@ -105,6 +116,7 @@ enum class FailureReason {
         PairingRefused -> "Host refused the pairing code"
         Authorization -> "Host refused the request"
         Stream -> "Screen stream stopped"
+        RelaySessionUnknown -> "The relay does not know this host"
     }
 
     /**
@@ -114,7 +126,9 @@ enum class FailureReason {
      * good. Offering retry where it cannot work teaches users to mash it.
      */
     fun isRetryable(): Boolean = when (this) {
-        Network, Stream -> true
+        // Retry can work: a host that was not running may be now. The detail
+        // says what else it might need.
+        Network, Stream, RelaySessionUnknown -> true
         QrNotPairingCode, InviteParse, InviteSignature, InviteExpired,
         UnsupportedAbi, NoiseHandshake, PairingRefused, Authorization -> false
     }
@@ -131,5 +145,41 @@ object SessionStatusPolicy {
             "idle" -> "native session ended: $detail"
             else -> "native session entered unexpected state '$state': $detail"
         }
+    }
+}
+
+/**
+ * What a failure reported by the native session means to the person holding
+ * the phone.
+ *
+ * Pure, so the mapping is tested on the JVM rather than by provoking each
+ * failure on a device.
+ */
+object NativeFailure {
+
+    /**
+     * The text the native client puts in front of a relay's refusal. Pinned on
+     * the Rust side by a test that reads this file, so the two cannot drift
+     * apart and quietly turn every relay refusal back into "stream stopped".
+     */
+    const val RELAY_REFUSED_MARK = "the relay refused this session"
+
+    /** Classify a native failure detail. */
+    fun classify(detail: String, reconnectingViaRelay: Boolean): SessionState.Failed {
+        if (!detail.contains(RELAY_REFUSED_MARK)) {
+            return SessionState.Failed(FailureReason.Stream, detail)
+        }
+        val advice = if (reconnectingViaRelay) {
+            // A stored route. Either the host is not connected to the relay, or
+            // the relay restarted since this device paired and the stored id is
+            // gone. The relay will not say which.
+            "Start RemoteDexter on the host. If it is already running, the relay has " +
+                "restarted since this phone paired — scan a fresh code from the host."
+        } else {
+            // A code just scanned. The session it names is not on the relay.
+            "Check RemoteDexter is running on the host and connected to the relay, " +
+                "then make a fresh code."
+        }
+        return SessionState.Failed(FailureReason.RelaySessionUnknown, advice)
     }
 }

@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 pub enum Reach {
     /// Bound to one deliberately chosen interface and accepting.
     ///
-    /// **The only variant in which a listener exists.**
+    /// **A listener exists** — here and in [`Reach::Both`], and nowhere else.
     Bound(SocketAddr),
     /// Dialled out to a relay, holding a control connection.
     ///
@@ -32,14 +32,57 @@ pub enum Reach {
         /// of a LAN address.
         session: String,
     },
+    /// Both at once: bound to an interface AND dialled out to a relay.
+    ///
+    /// **A listener exists**, exactly as in [`Reach::Bound`]; the relay adds a
+    /// second way in without changing that. The relay connects on start and
+    /// the LAN route is added only when the operator clicks Start on an
+    /// interface — a listener is never opened automatically.
+    Both {
+        /// The bound interface and port.
+        bound: SocketAddr,
+        /// The relay this host dialled.
+        relay: SocketAddr,
+        /// The session id the relay issued.
+        session: String,
+    },
 }
 
 impl Reach {
     /// The address BOUND, if this route binds one. `None` for dial-out.
     pub fn bound(&self) -> Option<SocketAddr> {
         match self {
-            Reach::Bound(a) => Some(*a),
+            Reach::Bound(a) | Reach::Both { bound: a, .. } => Some(*a),
             Reach::ViaRelay { .. } => None,
+        }
+    }
+
+    /// The relay and the session it issued, if the host is reachable through
+    /// one.
+    pub fn relay(&self) -> Option<(SocketAddr, &str)> {
+        match self {
+            Reach::Bound(_) => None,
+            Reach::ViaRelay { relay, session } | Reach::Both { relay, session, .. } => {
+                Some((*relay, session.as_str()))
+            }
+        }
+    }
+
+    /// The reach of a host serving these routes, or `None` when it serves
+    /// none.
+    pub fn from_routes(
+        bound: Option<SocketAddr>,
+        relay: Option<(SocketAddr, String)>,
+    ) -> Option<Self> {
+        match (bound, relay) {
+            (None, None) => None,
+            (Some(a), None) => Some(Reach::Bound(a)),
+            (None, Some((relay, session))) => Some(Reach::ViaRelay { relay, session }),
+            (Some(bound), Some((relay, session))) => Some(Reach::Both {
+                bound,
+                relay,
+                session,
+            }),
         }
     }
 
@@ -48,6 +91,7 @@ impl Reach {
         match self {
             Reach::Bound(a) => a.to_string(),
             Reach::ViaRelay { relay, .. } => format!("via relay {relay}"),
+            Reach::Both { bound, relay, .. } => format!("{bound} and via relay {relay}"),
         }
     }
 }
@@ -64,7 +108,8 @@ pub enum HostState {
     /// Serving and reachable, no peer connected. This is the state in which a
     /// pairing QR is meaningful.
     Pairable {
-        /// How the host is reachable: a bound interface, or a relay it dialled.
+        /// How the host is reachable: a bound interface, a relay it dialled,
+        /// or both.
         reach: Reach,
     },
     /// Serving, with `peers` connected.
@@ -157,6 +202,10 @@ pub struct InviteView {
     pub token_fingerprint: String,
     /// Unix seconds at which this invitation stops being valid.
     pub expires_at: u64,
+    /// Which routes the code names, in words for the window — "the LAN
+    /// route", "the relay route", "both routes". Never an address or a
+    /// session id.
+    pub carries: String,
 }
 
 impl std::fmt::Debug for InviteView {
@@ -166,6 +215,7 @@ impl std::fmt::Debug for InviteView {
             .field("qr_size", &self.qr_size)
             .field("token_fingerprint", &self.token_fingerprint)
             .field("expires_at", &self.expires_at)
+            .field("carries", &self.carries)
             .finish_non_exhaustive()
     }
 }
@@ -176,8 +226,11 @@ impl std::fmt::Debug for InviteView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostCommand {
     /// Bind exactly this address and begin accepting. Rejected if a listener
-    /// already exists — restarting on a new address is Stop then Start, so the
-    /// old socket is provably gone before the new one appears.
+    /// already exists — moving to a new address is Stop listening then Start,
+    /// so the old socket is provably gone before the new one appears.
+    ///
+    /// Accepted while the host is serving through a relay, or still dialling
+    /// one: the LAN route is then ADDED and the host serves both.
     Start {
         /// The chosen interface and port.
         bind: SocketAddr,
@@ -186,15 +239,23 @@ pub enum HostCommand {
     ///
     /// Refused by a controller built without a dial-out, rather than falling
     /// back to binding: the two are different exposures and the operator chose
-    /// one of them. Rejected while already running, for the same reason `Start`
-    /// is — changing route is Stop then Start, so the old one is provably gone.
+    /// one of them. Rejected while a relay connection exists or is being
+    /// dialled. Accepted while the host is listening: the relay route is then
+    /// ADDED and the host serves both.
     StartViaRelay,
-    /// Drop the listener or the relay connection, every session, capture, and
+    /// Close the LAN listener and the sessions that came in through it, and
+    /// keep serving through the relay.
+    ///
+    /// Refused when the listener is the host's only live route: ending the
+    /// host is [`HostCommand::Stop`], and a command named for one route should
+    /// not quietly do more than that.
+    StopListening,
+    /// Drop the listener and the relay connection, every session, capture, and
     /// input devices, and wait for the tasks to exit.
     Stop,
-    /// Mint a pairing invitation for the address already bound.
+    /// Mint a pairing invitation for the routes the host is serving.
     ///
-    /// Only meaningful while listening: there is no address to invite anyone to
+    /// Only meaningful while running: there is no route to invite anyone to
     /// otherwise, and an invite minted against a guess is how the previous
     /// implementation ended up probing `8.8.8.8` for one.
     CreateInvite,
@@ -232,6 +293,40 @@ pub enum HostEvent {
     },
     /// A pairing invitation is ready.
     InviteReady(InviteView),
+    /// The outstanding invitation was revoked while the host kept running,
+    /// because a route it may name went away. Stop the display: the code is dead.
+    ///
+    /// On Stop the invitation dies too, but that is already said by
+    /// `StateChanged(Stopped)`.
+    InviteWithdrawn,
+    /// A dial-out failed and the host is going to try again.
+    ///
+    /// **Not a `Fault`.** Nothing has gone wrong that the operator must act on:
+    /// a relay that is briefly unreachable is an ordinary event on a laptop
+    /// that changes network, and reporting it as a failure would teach the
+    /// operator to ignore failures. A relay that REFUSES is a `Fault`, because
+    /// only a human can fix it.
+    RelayRetrying {
+        /// Which attempt just failed, counting from one.
+        attempt: u32,
+        /// How long until the next attempt.
+        in_seconds: u64,
+        /// Why the last attempt failed. Safe to display and log.
+        why: String,
+    },
+    /// The relay answered and REFUSED this host, and the host has stopped
+    /// dialling it.
+    ///
+    /// **Not a `RelayRetrying` and not a generic `Fault`.** "Unreachable,
+    /// trying again" needs nothing from the operator; "refused" needs a human —
+    /// the relay's operator has to enrol this host, or its credential changed —
+    /// and retrying would only hammer the relay with a credential it has
+    /// already rejected. The console shows the two differently, so they are
+    /// told apart by type, never by the wording of a message.
+    RelayRefused {
+        /// Why, as the relay put it. Safe to display and log.
+        why: String,
+    },
     /// Something went wrong. **Redacted by construction**: the controller only
     /// ever puts rule names and typed reasons in here, never an address it was
     /// given, a token, or key bytes.
@@ -249,5 +344,49 @@ impl HostEvent {
         HostEvent::Fault {
             message: format!("bind refused: {}", reason.reason()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn a(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    /// A host serving both routes IS listening — the relay adds a way in, it
+    /// does not hide the port — and knows its relay and session.
+    #[test]
+    fn the_routes_combine_into_one_reach_that_still_reports_the_listener() {
+        let lan = a("192.168.1.20:8082");
+        let relay = a("203.0.113.9:9443");
+        let session = "AAAAAAAAAAAAAAAAAAAAAA".to_string();
+
+        assert_eq!(Reach::from_routes(None, None), None);
+        assert_eq!(Reach::from_routes(Some(lan), None), Some(Reach::Bound(lan)));
+        let relayed = Reach::from_routes(None, Some((relay, session.clone()))).unwrap();
+        assert_eq!(relayed.bound(), None, "a relay alone binds nothing");
+        assert_eq!(relayed.relay(), Some((relay, session.as_str())));
+
+        let both = Reach::from_routes(Some(lan), Some((relay, session.clone()))).unwrap();
+        assert_eq!(both.bound(), Some(lan));
+        assert_eq!(both.relay(), Some((relay, session.as_str())));
+        assert_eq!(Reach::Bound(lan).relay(), None);
+
+        let serving = HostState::Pairable {
+            reach: both.clone(),
+        };
+        assert!(
+            serving.is_listening(),
+            "a host serving both routes has a listener"
+        );
+        assert_eq!(serving.bound(), Some(lan));
+        let described = both.describe();
+        assert!(described.contains("192.168.1.20:8082") && described.contains("203.0.113.9:9443"));
+        assert!(
+            !described.contains(&session),
+            "describe() leaked the session id"
+        );
     }
 }

@@ -1,0 +1,19 @@
+{
+  "stream_start": {"type":"stream_start","window":7,"input_coordinates":"normalized_v1"},
+  "stream_ack": {"type":"ack","for":"stream_start","input_coordinates":"normalized_v1"},
+  "geometry": [100, 200, 2020, 1280],
+  "moves": [
+    {
+      "command": {"type":"input_event","window":7,"coordinate_space":"normalized_v1","event":{"MouseMove":{"mode":"Absolute","dx":0,"dy":0,"abs_x":0,"abs_y":0}}},
+      "native": [100, 200]
+    },
+    {
+      "command": {"type":"input_event","window":7,"coordinate_space":"normalized_v1","event":{"MouseMove":{"mode":"Absolute","dx":0,"dy":0,"abs_x":49151,"abs_y":49151}}},
+      "native": [1539, 1009]
+    },
+    {
+      "command": {"type":"input_event","window":7,"coordinate_space":"normalized_v1","event":{"MouseMove":{"mode":"Absolute","dx":0,"dy":0,"abs_x":65535,"abs_y":65535}}},
+      "native": [2019, 1279]
+    }
+  ]
+}

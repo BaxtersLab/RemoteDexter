@@ -31,7 +31,8 @@
 //! call to an existing helper.
 
 use relay::auth::{BearerToken, EnrolThenProve, HostAuth, HostIdentity};
-use relay::{serve_connection, Relay};
+use relay::logline::{self, RefusalLog};
+use relay::{serve_connection_admitted, Relay};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -41,6 +42,11 @@ use tokio::net::TcpListener;
 /// A connection that has not yet said who it is costs a task and a buffer. The
 /// bound is what stops a stranger accumulating them; refusing costs one accept
 /// and one close, which is cheaper than holding what it asked for.
+///
+/// It counts ONLY connections that have not identified themselves: the permit
+/// goes into `serve_connection_admitted` and is released at a successful
+/// register, join or attach. Until 2026-09-14 it was held for the connection's
+/// whole life, so registered hosts and live sessions counted against it.
 const MAX_PENDING: usize = 256;
 
 /// How `relayd` was told to run.
@@ -184,10 +190,33 @@ async fn main() {
 
     let relay = Relay::new(config.into_auth());
     let pending = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING));
+    // One refusal line per second at most, with the rest counted: a line per
+    // refused connection let a flood exceed journald's rate limit and blind
+    // whatever watches the log. See `relay::logline`.
+    let mut refusals = RefusalLog::new(MAX_PENDING);
+    let mut refusal_tick = tokio::time::interval(logline::REFUSAL_LINE_INTERVAL);
+    refusal_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // How full the relay is, said on a tick rather than per registration — a
+    // host reconnecting is not news — and throttled: see `CapacityLog`.
+    let mut capacity_log = logline::CapacityLog::default();
 
     loop {
         let accepted = tokio::select! {
             a = listener.accept() => a,
+            _ = refusal_tick.tick() => {
+                if let Some(line) = refusals.flush(std::time::Instant::now()) {
+                    eprintln!("{line}");
+                }
+                // Say how full the relay is once it is half full, when it moves
+                // into a different 10% band, and never more than once a minute.
+                let (live, capacity, percent) = relay.load();
+                if let Some(line) =
+                    capacity_log.observe(live, capacity, percent, std::time::Instant::now())
+                {
+                    eprintln!("{line}");
+                }
+                continue;
+            }
             _ = shutdown_signal() => {
                 eprintln!("[relayd] signal received — no longer accepting");
                 break;
@@ -198,18 +227,21 @@ async fn main() {
         // Refuse rather than queue. A queued connection costs a task and a
         // buffer for as long as the peer cares to hold it.
         let Ok(permit) = pending.clone().try_acquire_owned() else {
-            eprintln!("[relayd] refused {peer}: {MAX_PENDING} connections already unauthenticated");
+            if let Some(line) = refusals.refused(&peer, std::time::Instant::now()) {
+                eprintln!("{line}");
+            }
             drop(sock);
             continue;
         };
 
         let r = relay.clone();
         tokio::spawn(async move {
-            let outcome = serve_connection(&r, sock).await;
-            drop(permit);
+            // The permit is released inside, the moment the connection has
+            // identified itself: the cap counts only connections that have not.
+            let outcome = serve_connection_admitted(&r, sock, permit).await;
             if let Err(e) = outcome {
                 // The coarse public reason, which is all the peer was told.
-                eprintln!("[relayd] {peer}: {}", e.public_reason());
+                eprintln!("{}", logline::peer_line(&peer, e.public_reason()));
             }
         });
     }

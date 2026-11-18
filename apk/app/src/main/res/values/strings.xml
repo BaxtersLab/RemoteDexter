@@ -5,6 +5,17 @@
     <string name="keyboard">Keys</string>
     <string name="keyboard_field_description">Remote typing field</string>
     <string name="keyboard_needs_control">Press Enable Control before typing</string>
+    <!-- RD-TEXT-1: what the compose bar says when a paragraph is not typed. Every
+         one of these leaves or puts the text back in the field. -->
+    <string name="keyboard_too_long">Too long to type in one go: %1$d characters, and the limit is %2$d (Enter counts as one). Your text is still in the box.</string>
+    <string name="keyboard_too_large">Too much to send in one go: this text takes %1$d bytes and the limit is %2$d. Quotes, slashes and line breaks count double; emoji and accented letters count more, and the host cannot type those. Your text is still in the box.</string>
+    <string name="keyboard_not_queued">Not sent: the connection is not taking input right now. Your text is still in the box.</string>
+    <string name="text_returned_untypable">Not typed: the host cannot type %1$s. It types plain US-keyboard characters only. Your text is back in the box.</string>
+    <string name="text_returned_too_long">Not typed: longer than this host accepts in one go (%1$d characters). Your text is back in the box.</string>
+    <string name="text_returned_too_long_unknown">Not typed: longer than this host accepts in one go. Your text is back in the box.</string>
+    <string name="text_returned_partway">Typing stopped after %1$d of %2$d characters (%3$s). The rest is back in the box.</string>
+    <string name="text_returned_before_enter">Your text was typed, but Enter was not pressed (%1$s).</string>
+    <string name="text_returned_not_typed">Not typed (%1$s). Your text is back in the box.</string>
     <string name="compose_hint">Type, then Type or Enter</string>
     <string name="send">Type</string>
     <string name="pointer_touch">Touch</string>
@@ -140,5 +151,5 @@
          console carries the same notice. -->
     <string name="licence_notice">RemoteDexter \u2014 AGPL-3.0-only</string>
     <string name="licence_source_label">Source code</string>
-    <string name="licence_source_url" translatable="false">https://baxters.vip/remotedexter/</string>
+    <string name="licence_source_url" translatable="false">https://github.com/BaxtersLab/RemoteDexter</string>
 </resources>

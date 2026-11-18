@@ -1,7 +1,7 @@
 #!/bin/sh
 # remotedexter-enable-input — the only privileged operation RemoteDexter has.
 #
-# Installed root-owned at /usr/libexec/remotedexter/remotedexter-enable-input,
+# Installed root-owned at /opt/baxters/remotedexter/remotedexter-enable-input,
 # mode 0755. The host UI invokes it through `pkexec`, which asks for ordinary
 # administrator authentication. RemoteDexter installs NO polkit rule of its
 # own: a shipped .policy that says "allow_active=yes" is a permanent standing
@@ -53,7 +53,7 @@ set -u
 # told to write anywhere.
 RULE_DIR='/etc/udev/rules.d'
 DEST='/etc/udev/rules.d/70-remotedexter-uinput.rules'
-SRC='/usr/share/remotedexter/70-remotedexter-uinput.rules'
+SRC='/opt/baxters/remotedexter/70-remotedexter-uinput.rules'
 TMP_PREFIX='/etc/udev/rules.d/.70-remotedexter-uinput.rules.tmp.'
 UINPUT_DEV='/dev/uinput'
 UINPUT_SYSPATH='/sys/devices/virtual/misc/uinput'

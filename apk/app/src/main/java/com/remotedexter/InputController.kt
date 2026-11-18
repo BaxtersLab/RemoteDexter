@@ -1,8 +1,34 @@
 package com.remotedexter
 
 object ControlDenialPolicy {
-    fun losesGrant(forCmd: String): Boolean =
-        forCmd == "grant_input" || forCmd == "input_event"
+    /**
+     * Whether a refusal means this phone no longer holds input control.
+     *
+     * A refused `input_event` usually does — the host refuses input to a peer
+     * without the grant. But a TEXT run is also refused for its CONTENT (a
+     * character the host cannot type, a run over its ceiling), and the host
+     * still holds the grant then. Reading those as a lost grant switched the
+     * phone to Viewing Only after an accented letter, and the operator's next
+     * tap went nowhere (RD-TEXT-1).
+     */
+    fun losesGrant(forCmd: String, reason: String = ""): Boolean =
+        forCmd == "grant_input" ||
+            (forCmd == "input_event" && reason !in TextReturn.ABOUT_THE_TEXT)
+}
+
+/** What became of a Type or Go press — what the compose field should do. */
+sealed class TextSend {
+    /** Queued for the host. The field clears; a refusal will put it back. */
+    object Queued : TextSend()
+
+    /** Not sent, by [action]'s rule. The field keeps the text. */
+    data class Refused(val action: KeyboardInput.Action) : TextSend()
+
+    /** Allowed, but the session would not take it. The field keeps the text. */
+    object NotQueued : TextSend()
+
+    /** Only a queued run may clear the field; anything else would lose text. */
+    val clearsField: Boolean get() = this is Queued
 }
 
 /**
@@ -188,6 +214,17 @@ object InputController {
      */
     var onControlDenied: ((forCmd: String, reason: String) -> Unit)? = null
 
+    /** Paragraphs sent and not yet answered for. See [PendingTexts]. */
+    private val pendingTexts = PendingTexts()
+
+    /**
+     * Notified when the host refuses or stops a text run this phone sent,
+     * with the part that did not reach the desktop — for the compose field to
+     * take back. Called INSTEAD of [onControlDenied] for that refusal, so the
+     * operator gets one message about their text rather than two.
+     */
+    var onTextReturned: ((reason: String, returned: PendingTexts.Returned, max: Int?) -> Unit)? = null
+
     fun isControlEnabled(): Boolean = controlEnabled
 
     /** True while a long-press has latched the left button down. */
@@ -227,14 +264,30 @@ object InputController {
         }
     }
 
-    /** Called by [SessionOrchestrator.onHostMessage] on a denial/error for our commands. */
-    fun onDenied(forCmd: String, reason: String) {
+    /**
+     * An `input_event` was acknowledged. Most are pointer moves and name no
+     * text run; one that does was typed in full, and its copy can go.
+     */
+    fun onInputAck(ack: org.json.JSONObject) {
+        InputJson.textReply(ack)?.let { pendingTexts.settle(it.id) }
+    }
+
+    /**
+     * Called by [SessionOrchestrator.onHostMessage] on a denial/error for our
+     * commands. [text] is set when the reply names a text run this phone sent.
+     */
+    fun onDenied(forCmd: String, reason: String, text: InputJson.TextReply? = null) {
         RdxLog.w(TAG, "$forCmd denied: $reason")
         pending = false
         // Told before the state is touched: a refusal most often changes no
         // state at all, so waiting for onControlStateChanged would swallow it.
-        onControlDenied?.invoke(forCmd, reason)
-        if (ControlDenialPolicy.losesGrant(forCmd)) {
+        val returned = text?.let { pendingTexts.refused(it.id, it.typed, it.at) }
+        if (returned != null) {
+            onTextReturned?.invoke(reason, returned, text.max)
+        } else {
+            onControlDenied?.invoke(forCmd, reason)
+        }
+        if (ControlDenialPolicy.losesGrant(forCmd, reason)) {
             setEnabled(false)
         }
         // A denied revoke leaves the host grant's state uncertain, so retain
@@ -250,9 +303,9 @@ object InputController {
     }
 
     /**
-     * Move the host pointer to an exact desktop pixel.
+     * Move the host pointer to the mapped position, preserving its coordinate space.
      *
-     * [x] and [y] must already be inside the frame — they land in a `u32`
+     * [position] must already be inside the mapped bounds — its axes land in a `u32`
      * host-side, so a negative value does not merely misbehave, it fails to
      * parse and the event is dropped silently. `DesktopCoordinateMapper` is what
      * guarantees the clamp, and the caller is expected to have used it.
@@ -263,10 +316,10 @@ object InputController {
      * where the finger stopped. Android already batches touch samples to the
      * display refresh, which bounds the rate.
      */
-    fun onAbsoluteMove(x: Int, y: Int) {
+    fun onAbsoluteMove(position: PointerPosition) {
         val windowId = SessionOrchestrator.currentWindowId()
         if (!InputEmissionPolicy.mayEmit(controlEnabled, windowId)) return
-        sendAbsoluteMove(windowId, x, y)
+        sendAbsoluteMove(windowId, position)
     }
 
     /**
@@ -277,12 +330,12 @@ object InputController {
      * the pointer happened to be left — which is the bug this whole change
      * exists to avoid.
      */
-    fun onTapAt(x: Int, y: Int) {
+    fun onTapAt(position: PointerPosition) {
         val windowId = SessionOrchestrator.currentWindowId()
         if (!InputEmissionPolicy.mayEmit(controlEnabled, windowId)) return
         AbsoluteInputSequence.tap(
-            x, y,
-            move = { mx, my -> sendAbsoluteMove(windowId, mx, my) },
+            position.x, position.y,
+            move = { _, _ -> sendAbsoluteMove(windowId, position) },
             button = { b, action -> sendButton(windowId, b, action) }
         )
     }
@@ -294,12 +347,12 @@ object InputController {
      * at the pointer, so clicking without moving first opens one where the
      * operator is not looking.
      */
-    fun onSecondaryTapAt(x: Int, y: Int) {
+    fun onSecondaryTapAt(position: PointerPosition) {
         val windowId = SessionOrchestrator.currentWindowId()
         if (!InputEmissionPolicy.mayEmit(controlEnabled, windowId)) return
         AbsoluteInputSequence.secondaryTap(
-            x, y,
-            move = { mx, my -> sendAbsoluteMove(windowId, mx, my) },
+            position.x, position.y,
+            move = { _, _ -> sendAbsoluteMove(windowId, position) },
             button = { b, action -> sendButton(windowId, b, action) }
         )
     }
@@ -309,13 +362,13 @@ object InputController {
      * button down. Movement while latched stays absolute, so the drag follows
      * the offset cursor rather than the fingertip.
      */
-    fun onLongPressAt(x: Int, y: Int) {
+    fun onLongPressAt(position: PointerPosition) {
         val windowId = SessionOrchestrator.currentWindowId()
         if (!InputEmissionPolicy.mayEmit(controlEnabled, windowId)) return
         if (latch.press()) {
             AbsoluteInputSequence.longPress(
-                x, y,
-                move = { mx, my -> sendAbsoluteMove(windowId, mx, my) },
+                position.x, position.y,
+                move = { _, _ -> sendAbsoluteMove(windowId, position) },
                 button = { b, action -> sendButton(windowId, b, action) }
             )
             RdxLog.i(TAG, "drag latched")
@@ -482,8 +535,11 @@ object InputController {
         }
     }
 
-    private fun sendAbsoluteMove(windowId: Long, x: Int, y: Int) {
-        send(InputJson.moveAbsolute(windowId, x, y), "input_event(abs move)")
+    private fun sendAbsoluteMove(windowId: Long, position: PointerPosition) {
+        send(
+            InputJson.moveAbsolute(windowId, position.x, position.y, position.space),
+            "input_event(abs move)"
+        )
     }
 
     private fun sendMove(windowId: Long, d: Delta) {
@@ -505,11 +561,9 @@ object InputController {
      * the host knows which position produces which character. The host expands
      * it in `module10::keymap`.
      */
-    fun commitText(buffer: String): KeyboardInput.Action {
+    fun commitText(buffer: String): TextSend {
         val windowId = SessionOrchestrator.currentWindowId()
-        val action = KeyboardInput.onCommit(controlEnabled, windowId, buffer)
-        perform(windowId, action, "text")
-        return action
+        return sendComposed(windowId, buffer, KeyboardInput.onCommit(controlEnabled, windowId, buffer))
     }
 
     /**
@@ -519,11 +573,31 @@ object InputController {
      * command are different acts, and a keyboard that could only do the second
      * could not fill in a form.
      */
-    fun stageText(buffer: String): KeyboardInput.Action {
+    fun stageText(buffer: String): TextSend {
         val windowId = SessionOrchestrator.currentWindowId()
-        val action = KeyboardInput.onStage(controlEnabled, windowId, buffer)
-        perform(windowId, action, "text")
-        return action
+        return sendComposed(windowId, buffer, KeyboardInput.onStage(controlEnabled, windowId, buffer))
+    }
+
+    /**
+     * Put a composed run on the wire, under an id the host will answer to.
+     *
+     * The result is what tells the compose field whether it may clear. It used
+     * to clear on any decision to send, BEFORE knowing whether the session had
+     * taken the command — so a send into a closing session lost the text with
+     * nothing on the wire to show for it (RD-TEXT-1).
+     */
+    private fun sendComposed(windowId: Long, composed: String, action: KeyboardInput.Action): TextSend {
+        if (action !is KeyboardInput.Action.SendText) {
+            perform(windowId, action, "text")
+            return TextSend.Refused(action)
+        }
+        val id = pendingTexts.register(composed)
+        if (RDRust.sendCommand(InputJson.text(windowId, action.text, id))) {
+            return TextSend.Queued
+        }
+        pendingTexts.forget(id)
+        RdxLog.w(TAG, "could not send input_event(text) — session not accepting commands")
+        return TextSend.NotQueued
     }
 
     /**
@@ -542,12 +616,18 @@ object InputController {
 
     private fun perform(windowId: Long, action: KeyboardInput.Action, what: String) {
         when (action) {
+            // Text always goes under an id, so even a caller that reaches here
+            // with text gets its refusal answered.
             is KeyboardInput.Action.SendText ->
-                send(InputJson.text(windowId, action.text), "input_event(text)")
+                sendComposed(windowId, action.text, action)
             is KeyboardInput.Action.SendKey ->
                 sendKeyStroke(windowId, action.scanCode)
             is KeyboardInput.Action.Drop ->
                 RdxLog.i(TAG, "not sending $what: ${action.why}")
+            is KeyboardInput.Action.TooLong ->
+                RdxLog.i(TAG, "not sending $what: ${action.length} characters is over the ${action.max} limit")
+            is KeyboardInput.Action.TooLargeToSend ->
+                RdxLog.i(TAG, "not sending $what: ${action.bytes} bytes is over the ${action.max}-byte input envelope")
         }
     }
 
@@ -661,6 +741,8 @@ object InputController {
     fun reset() {
         releaseAllHeldInput()
         motion.reset()
+        // No answer for any of these is coming from a session that has ended.
+        pendingTexts.clear()
         setEnabled(false)
     }
 }

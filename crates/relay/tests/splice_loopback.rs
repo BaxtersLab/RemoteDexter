@@ -8,8 +8,8 @@
 use relay::auth::{BearerToken, EnrolThenProve, HostIdentity};
 use relay::frame::{self, ControlFrame, PROTOCOL_VERSION};
 use relay::{
-    accept_data, confirm_join, heartbeat, join_client, mint_attach, register_host,
-    serve_connection, splice, Relay,
+    accept_data, attach_control, confirm_join, heartbeat, join_client, mint_attach, notify_host,
+    register_host, release_if_current, serve_connection, splice, Relay,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -986,5 +986,401 @@ async fn a_socket_that_says_nothing_is_dropped() {
     assert!(
         matches!(closed, Ok(0)) || closed.is_err(),
         "a silent socket was neither closed nor errored"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A splice must end when one side stops taking bytes, and must not buffer
+// megabytes on the way.
+//
+// Measured through the deployed relay, 2026-09-14: a phone that switched off
+// Wi-Fi left its session spliced for over three minutes, holding one of the 64
+// slots and ~8.5 MB of buffered stream, waiting for TCP to give up. And while
+// the phone was merely slow, the relay's autotuned socket buffers soaked up a
+// growing backlog (2.6 MB, 8-10 s of delay) so the host's own link to the relay
+// always looked healthy and its congestion handling never engaged.
+
+/// Two connected loopback sockets, with the FAR end's buffers kept small so the
+/// relay's own buffering is what the tests measure.
+async fn loopback_pair(far_buffer: u32) -> (TcpStream, TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let far = tokio::net::TcpSocket::new_v4().unwrap();
+    far.set_send_buffer_size(far_buffer).unwrap();
+    far.set_recv_buffer_size(far_buffer).unwrap();
+    let (far, near) = tokio::join!(far.connect(addr), listener.accept());
+    (near.unwrap().0, far.unwrap())
+}
+
+#[tokio::test]
+async fn a_splice_whose_far_side_stops_reading_ends_and_frees_its_slot() {
+    let (mut host_near, mut host_far) = loopback_pair(64 * 1024).await;
+    let (mut phone_near, _phone_far_never_reads) = loopback_pair(64 * 1024).await;
+
+    let stall = Duration::from_secs(2);
+    let splice =
+        tokio::spawn(
+            async move { relay::splice_within(&mut host_near, &mut phone_near, stall).await },
+        );
+    let writer = tokio::spawn(async move {
+        let chunk = vec![0x5au8; 16 * 1024];
+        while host_far.write_all(&chunk).await.is_ok() {}
+    });
+
+    let ended = tokio::time::timeout(Duration::from_secs(20), splice).await;
+    writer.abort();
+    let report = ended
+        .expect("a splice to a phone that took nothing for 20 s was still running")
+        .unwrap();
+    assert_eq!(report.end, relay::SpliceEnd::Stalled);
+}
+
+#[tokio::test]
+async fn a_splice_holds_a_bounded_backlog_for_a_side_that_stopped_reading() {
+    let (mut host_near, mut host_far) = loopback_pair(64 * 1024).await;
+    let (mut phone_near, mut phone_far) = loopback_pair(64 * 1024).await;
+
+    let splice = tokio::spawn(async move {
+        relay::splice_within(&mut host_near, &mut phone_near, Duration::from_secs(600)).await
+    });
+
+    // A good stretch first, flat out with the phone reading, as a real session
+    // has before the path slows: this is when autotuned buffers grow, and the
+    // 2026-09-14 backlog was buffers grown in good minutes holding bad ones.
+    let reader = tokio::spawn(async move {
+        let mut buf = vec![0u8; 256 * 1024];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            if tokio::time::timeout(Duration::from_millis(100), phone_far.read(&mut buf))
+                .await
+                .is_ok_and(|r| r.is_err())
+            {
+                break;
+            }
+        }
+        phone_far // stop reading, keep the connection open
+    });
+    let chunk = vec![0xa5u8; 16 * 1024];
+    while !reader.is_finished() {
+        host_far.write_all(&chunk).await.unwrap();
+    }
+    let _phone_far_now_silent = reader.await.unwrap();
+
+    // Now the phone reads nothing: how much more will the relay take?
+    let mut accepted = 0usize;
+    while let Ok(Ok(())) =
+        tokio::time::timeout(Duration::from_secs(1), host_far.write_all(&chunk)).await
+    {
+        accepted += chunk.len();
+        assert!(accepted < 64 * 1024 * 1024, "no pushback after 64 MB");
+    }
+    splice.abort();
+    eprintln!("after a fast stretch, the host could hand the relay {accepted} more bytes for a phone reading nothing");
+    assert!(
+        accepted <= relay::SPLICE_BACKLOG_BOUND,
+        "{accepted} bytes queued for a phone that read nothing (bound {}); the host is not told \
+         the path is slow until the relay's buffers are full",
+        relay::SPLICE_BACKLOG_BOUND
+    );
+}
+
+#[tokio::test]
+async fn spliced_sockets_carry_keepalive_so_a_silent_vanished_peer_is_noticed() {
+    let (mut a, _a_far) = loopback_pair(64 * 1024).await;
+    let (mut b, mut b_far) = loopback_pair(64 * 1024).await;
+    let splice = tokio::spawn(async move {
+        let a_ref: &mut TcpStream = &mut a;
+        // Checked from inside the splice's own setup: bound first, then inspect.
+        relay::bound_splice_socket(a_ref);
+        let ka = socket2::SockRef::from(&*a_ref).keepalive().unwrap();
+        (
+            ka,
+            relay::splice_within(a_ref, &mut b, Duration::from_secs(600)).await,
+        )
+    });
+    // End the splice from the far side so the task returns.
+    b_far.shutdown().await.unwrap();
+    drop(b_far);
+    let (keepalive, report) = tokio::time::timeout(Duration::from_secs(10), splice)
+        .await
+        .expect("closing one side must end the splice")
+        .unwrap();
+    assert!(
+        keepalive,
+        "a spliced socket without keepalive holds a slot for a phone that vanished silently"
+    );
+    assert_eq!(report.end, relay::SpliceEnd::Closed);
+}
+
+// ---------------------------------------------------------------------------
+// A socket that says nothing is logged as silent, not as an ordinary close.
+//
+// A flood of connect-and-wait sockets used to read, in the relay's log, exactly
+// like phones disconnecting — "connection closed". A watcher cannot classify
+// what the relay does not distinguish.
+
+#[tokio::test(start_paused = true)]
+async fn a_socket_that_sends_nothing_is_reported_as_silent() {
+    let (relay, _addr, listener) = bearer_relay("t").await;
+    let addr = listener.local_addr().unwrap();
+    let (_client, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+    let (sock, _) = accepted.unwrap();
+    let outcome = serve_connection(&relay, sock).await;
+    let err = outcome.expect_err("a silent socket must not be served");
+    assert!(matches!(err, relay::ServeError::Silent), "got {err:?}");
+    assert_eq!(err.public_reason(), "no frame within 10 s");
+}
+
+#[tokio::test]
+async fn a_socket_that_closes_at_once_is_still_an_ordinary_close() {
+    let (relay, _addr, listener) = bearer_relay("t").await;
+    let addr = listener.local_addr().unwrap();
+    let (client, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+    drop(client.unwrap());
+    let (sock, _) = accepted.unwrap();
+    let err = serve_connection(&relay, sock)
+        .await
+        .expect_err("nothing to serve");
+    assert!(matches!(err, relay::ServeError::Io), "got {err:?}");
+    assert_eq!(err.public_reason(), "connection closed");
+}
+
+/// Register an enrolled host over a real socket and return the session id the
+/// relay issued. Used twice by the reconnect test, which is the point: the
+/// SECOND call is a host coming back.
+async fn signing_host_registers(
+    relay: &Arc<Relay>,
+    addr: SocketAddr,
+    listener: &TcpListener,
+    sk: &ed25519_dalek::SigningKey,
+) -> String {
+    use base64::Engine;
+    use ed25519_dalek::Signer;
+    let host_pub = base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().to_bytes());
+
+    let mut host = TcpStream::connect(addr).await.unwrap();
+    let (mut server_side, _) = listener.accept().await.unwrap();
+    let r = relay.clone();
+    let server = tokio::spawn(async move { register_host(&r, &mut server_side).await });
+
+    write_frame(
+        &mut host,
+        &ControlFrame::Register {
+            v: PROTOCOL_VERSION,
+            host_pub,
+        },
+    )
+    .await;
+    let nonce = match read_frame(&mut host).await {
+        ControlFrame::Challenge { nonce } => base64::engine::general_purpose::STANDARD
+            .decode(nonce)
+            .unwrap(),
+        other => panic!("expected Challenge, got {other:?}"),
+    };
+    let sig = base64::engine::general_purpose::STANDARD.encode(sk.sign(&nonce).to_bytes());
+    write_frame(&mut host, &ControlFrame::Prove { sig }).await;
+
+    let id = server.await.unwrap().expect("an enrolled host was refused");
+    id.as_str().to_string()
+}
+
+/// **A host that reconnects keeps the session id its invite already names.**
+///
+/// The whole reason the relay could not be a default route: the id was random
+/// per registration, so every host restart invalidated the pairing QR and the
+/// operator had to walk to the machine and scan a new one. Proven over real
+/// sockets through the real registration path, not against the table alone.
+#[tokio::test]
+async fn an_enrolled_host_that_reconnects_is_given_the_same_session_id() {
+    use ed25519_dalek::SigningKey;
+    let sk = SigningKey::generate(&mut rand::rngs::OsRng);
+    let identity = HostIdentity(sk.verifying_key().to_bytes());
+    let relay = Relay::new(Box::new(EnrolThenProve::new(&[identity])));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let first = signing_host_registers(&relay, addr, &listener, &sk).await;
+    let second = signing_host_registers(&relay, addr, &listener, &sk).await;
+
+    assert_eq!(
+        first, second,
+        "a host that reconnected was given a new session id, so its pairing code is dead"
+    );
+    assert_eq!(
+        relay.session_count(),
+        1,
+        "reconnecting took a second session slot for one host"
+    );
+}
+
+/// **Two hosts are still two sessions.** The derivation must depend on WHICH
+/// host registered; one that ignored the identity would hand every host the
+/// same id and splice the operator's phone into a stranger's machine.
+#[tokio::test]
+async fn two_enrolled_hosts_get_different_sessions() {
+    use ed25519_dalek::SigningKey;
+    let one = SigningKey::generate(&mut rand::rngs::OsRng);
+    let two = SigningKey::generate(&mut rand::rngs::OsRng);
+    let relay = Relay::new(Box::new(EnrolThenProve::new(&[
+        HostIdentity(one.verifying_key().to_bytes()),
+        HostIdentity(two.verifying_key().to_bytes()),
+    ])));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let a = signing_host_registers(&relay, addr, &listener, &one).await;
+    let b = signing_host_registers(&relay, addr, &listener, &two).await;
+
+    assert_ne!(a, b, "two different hosts were given the same session id");
+    assert_eq!(relay.session_count(), 2);
+}
+
+/// **A superseded control connection must not release the session that replaced
+/// it.**
+///
+/// With stable ids a reconnecting host registers the id its previous connection
+/// still holds, so for a moment two control loops exist for one session. The old
+/// one is going to exit — its socket is dead, which is why the host reconnected
+/// — and if its cleanup removed the session, the host would have restarted
+/// itself into an id that nothing answers. The failure is invisible until a
+/// phone tries to connect, which is the worst possible moment to find it.
+#[tokio::test]
+async fn a_superseded_control_connection_does_not_release_the_new_session() {
+    let relay = Relay::new(Box::new(BearerToken::new(&["a-token".to_string()])));
+    let id = relay::SessionId::parse("AAAAAAAAAAAAAAAAAAAAAA").unwrap();
+
+    let (mut old_rx, old_gen) = attach_control(&relay, &id);
+    let (_new_rx, new_gen) = attach_control(&relay, &id);
+    assert_ne!(old_gen, new_gen, "two connections shared one generation");
+
+    // Replacing the sender is how the old loop learns it is finished.
+    assert!(
+        old_rx.recv().await.is_none(),
+        "a superseded control loop was never told: it would sit there pinging a dead socket"
+    );
+
+    assert!(
+        !release_if_current(&relay, &id, old_gen),
+        "the superseded connection released a session it no longer owned"
+    );
+    assert!(
+        notify_host(
+            &relay,
+            &id,
+            relay::Ticket::parse("BBBBBBBBBBBBBBBBBBBBBB").unwrap()
+        )
+        .is_ok(),
+        "the new control connection was unreachable after the old one cleaned up"
+    );
+
+    // The connection that DOES own it still releases it, or a host that really
+    // went away would leave an id a client can present for ever.
+    assert!(release_if_current(&relay, &id, new_gen));
+    assert!(notify_host(
+        &relay,
+        &id,
+        relay::Ticket::parse("BBBBBBBBBBBBBBBBBBBBBB").unwrap()
+    )
+    .is_err());
+}
+
+/// Register a bearer host directly and return its session id.
+async fn register_bearer_host(
+    relay: &Arc<Relay>,
+    listener: &TcpListener,
+    addr: SocketAddr,
+    token: &str,
+) -> (relay::SessionId, TcpStream) {
+    let mut host = TcpStream::connect(addr).await.unwrap();
+    let (mut server_side, _) = listener.accept().await.unwrap();
+    let r = relay.clone();
+    let server = tokio::spawn(async move {
+        let id = register_host(&r, &mut server_side).await.unwrap();
+        (id, server_side)
+    });
+    write_frame(
+        &mut host,
+        &ControlFrame::Register {
+            v: PROTOCOL_VERSION,
+            host_pub: token.to_string(),
+        },
+    )
+    .await;
+    let _registered = read_frame(&mut host).await;
+    let (id, _server_side) = server.await.unwrap();
+    (id, host)
+}
+
+fn join_frame(session: &str) -> ControlFrame {
+    ControlFrame::Join {
+        v: PROTOCOL_VERSION,
+        session: session.to_string(),
+    }
+}
+
+/// **A stranger inventing session ids leaves nothing in the join limiter.**
+///
+/// The first P4 build rate-limited BEFORE asking the table, so every well-formed
+/// id a stranger made up became a limiter entry, and every join — including a
+/// real phone's — paid to sweep them all. Found by the deploy agent's review. An
+/// id the table does not hold is now refused before the limiter is consulted.
+#[tokio::test]
+async fn a_stranger_inventing_session_ids_leaves_nothing_in_the_join_limiter() {
+    let (relay, addr, listener) = bearer_relay("a-token").await;
+    let _host = register_bearer_host(&relay, &listener, addr, "a-token").await;
+    let mut sock = TcpStream::connect(addr).await.unwrap();
+    let _accepted = listener.accept().await.unwrap();
+
+    for n in 0..2_000u32 {
+        let invented = format!("{:0>22}", n);
+        let outcome = relay::join_client_with(&relay, &mut sock, join_frame(&invented)).await;
+        assert_eq!(
+            outcome.as_ref().err().map(|e| e.public_reason()),
+            Some("no such session"),
+            "an invented id was not refused as unknown"
+        );
+    }
+    assert_eq!(
+        relay.tracked_joins(),
+        0,
+        "invented session ids were recorded by the join limiter"
+    );
+}
+
+/// **Churning a KNOWN session is refused before it claims the host's slot.**
+///
+/// The limiter exists for this: a stranger who has learned a real id and joins
+/// it over and over. Refusing AFTER claiming would still take the host's slot on
+/// every attempt — the phone's slot, while the stranger is refused. So the
+/// refused join must leave the session unoccupied.
+#[tokio::test]
+async fn churning_a_known_session_is_refused_before_it_claims_the_hosts_slot() {
+    let (relay, addr, listener) = bearer_relay("a-token").await;
+    let (id, _host) = register_bearer_host(&relay, &listener, addr, "a-token").await;
+    let mut sock = TcpStream::connect(addr).await.unwrap();
+    let _accepted = listener.accept().await.unwrap();
+
+    for attempt in 1..=relay::session::MAX_JOINS_PER_WINDOW {
+        let joined = relay::join_client_with(&relay, &mut sock, join_frame(id.as_str())).await;
+        assert!(
+            joined.is_ok(),
+            "join {attempt} of a real session was refused"
+        );
+        relay::vacate_session(&relay, &id);
+    }
+    let refused = relay::join_client_with(&relay, &mut sock, join_frame(id.as_str())).await;
+    assert_eq!(
+        refused.as_ref().err().map(|e| e.public_reason()),
+        Some("no such session"),
+        "a churned session was not refused"
+    );
+    assert!(
+        !relay.is_occupied(&id),
+        "the refused join had already claimed the host's slot"
+    );
+    assert!(
+        relay.tracked_joins() <= 1,
+        "one known session is tracked as {}",
+        relay.tracked_joins()
     );
 }

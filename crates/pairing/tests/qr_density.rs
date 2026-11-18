@@ -136,3 +136,126 @@ fn the_relay_qr_costs_more_than_the_direct_one() {
         direct.size
     );
 }
+
+/// The v6 payload, from its own digest-pinned vector.
+fn dual_payload() -> String {
+    payload_from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../contract/signed_invite_v6.json"
+    ))
+}
+
+/// The largest QR the REAL service draws for a dual invite over `mints` mints.
+///
+/// Many mints, not one: the token and signature differ every time, and before
+/// `qr::encode` took the smaller of two encodings the size depended on their
+/// characters — the same routes gave 101 or 105 modules from one mint to the
+/// next. One lucky mint proved nothing.
+fn largest_minted_dual_qr(lan: &str, relay: &str, mints: u8) -> usize {
+    (0..mints)
+        .map(|i| {
+            let signing = ed25519_dalek::SigningKey::from_bytes(&[i; 32]);
+            let pubkey_hex: String = signing
+                .verifying_key()
+                .as_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            let mut service = pairing::PairingService::new(signing, pubkey_hex);
+            let caps = [
+                pairing::CAP_VIEW.to_string(),
+                pairing::CAP_CONTROL.to_string(),
+            ];
+            service
+                .create_dual_invite(
+                    lan.parse().expect("lan address"),
+                    relay.parse().expect("relay address"),
+                    // 16 bytes, base64url without padding: the relay's session id size.
+                    "AAAAAAAAAAAAAAAAAAAAAA",
+                    1_787_000_000,
+                    &caps,
+                )
+                .unwrap_or_else(|e| panic!("minting a dual invite for {lan} / {relay}: {e:?}"))
+                .qr
+                .size
+        })
+        .max()
+        .expect("at least one mint")
+}
+
+/// **v6 carries both routes and costs no more modules than v5**, measured from
+/// the encoder on 2026-09-17: 602 bytes against v5's 568, and both are 101
+/// modules (version 19; one byte-mode segment of 561-624 bytes fits it at EC
+/// level M). The design expected a small density cost; at IPv4 sizes there is
+/// none — once `qr::encode` stopped trusting the library's segment optimizer,
+/// which had put 23-36% of real dual invites at 105.
+///
+/// The headroom is only 22 bytes on the fixture, which is why the next test
+/// mints the LONGEST IPv4 invite rather than trusting the fixture's short
+/// addresses: that is the size a real host's code will actually be.
+#[test]
+fn the_dual_route_qr_is_no_denser_than_it_is_today() {
+    const MODULE_BUDGET: usize = 101;
+
+    let payload = dual_payload();
+    let qr = pairing::qr::encode(&payload).expect("encodes");
+
+    assert!(
+        qr.size <= MODULE_BUDGET,
+        "the dual-route pairing QR grew to {} modules ({} byte payload). At a \
+         440px render that is {:.2} px/module against {:.2} today, and the \
+         measured failure was at ~2-3 px/module BEFORE optics. If this growth \
+         is intended, move the budget deliberately and say what it buys.",
+        qr.size,
+        payload.len(),
+        440.0 / qr.size as f32,
+        440.0 / MODULE_BUDGET as f32,
+    );
+}
+
+/// The longest IPv4 addresses and ports a host can put in a v6 still fit the
+/// v5 symbol size — so turning on "Pairing codes carry both routes" never makes
+/// the operator's code coarser than the relay code they already scan.
+#[test]
+fn the_longest_ipv4_dual_route_qr_is_no_bigger_than_the_relay_one() {
+    let size = largest_minted_dual_qr("255.255.255.255:65535", "255.255.255.254:65535", 64);
+    assert!(
+        size <= 101,
+        "a v6 invite with the longest IPv4 routes encodes at {size} modules, above \
+         v5's 101 — every real host with long addresses would show a coarser code"
+    );
+}
+
+/// IPv6 is the worst case: two 39-character addresses make a 659-byte payload,
+/// one version up. Pinned so the cost is known — 105 modules is 4.19 px/module
+/// at 440 px (before the encoder fix most such mints drew 109), still
+/// clear of the ~2-3 px/module failure region — and so a field added later
+/// cannot quietly push the worst case further.
+#[test]
+fn the_longest_ipv6_dual_route_qr_stays_within_one_version_of_the_relay_one() {
+    let size = largest_minted_dual_qr(
+        "[ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffe]:65535",
+        "[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:65535",
+        64,
+    );
+    assert!(
+        size <= 105,
+        "a v6 invite with the longest IPv6 routes encodes at {size} modules \
+         ({:.2} px/module at 440 px); the pinned worst case is 105",
+        440.0 / size as f32
+    );
+}
+
+/// The dual invite is never the SMALLER code — it carries everything v5 does
+/// plus the LAN route. If this ever fails, a fixture is not what it claims.
+#[test]
+fn the_dual_route_qr_costs_at_least_the_relay_one() {
+    let relay = pairing::qr::encode(&relay_payload()).expect("encodes");
+    let dual = pairing::qr::encode(&dual_payload()).expect("encodes");
+    assert!(
+        dual.size >= relay.size,
+        "the dual-route invite encoded smaller than the relay one ({} vs {} modules) — check the fixtures",
+        dual.size,
+        relay.size
+    );
+}

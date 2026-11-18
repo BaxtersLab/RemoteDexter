@@ -16,11 +16,95 @@
 
 use crate::backend::{HostBackend, ServeDispatch};
 use crate::bind;
-use crate::source::{DialOut, ListenSource, PeerSource};
+use crate::source::{retry_delay, DialFailure, DialOut, ListenSource, PeerSource};
 use crate::state::Reach;
 use crate::state::{HostCommand, HostEvent, HostState};
+use std::pin::Pin;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+
+/// How long a relay connection must hold before losing it counts as a fresh
+/// outage rather than one more in a row.
+///
+/// A relay that accepts the host and drops it at once would otherwise be
+/// re-dialled in a tight loop — hammering someone else's server, and burning
+/// this machine, for as long as the fault lasts. Losses closer together than
+/// this back off with the same schedule as a failed dial.
+const RELAY_STABLE_AFTER: Duration = Duration::from_secs(60);
+
+/// How many relay losses in a row this one makes, given how long the
+/// connection that just ended had lived. A connection that held for
+/// [`RELAY_STABLE_AFTER`] ends a run of losses; anything shorter extends it.
+fn next_relay_losses(losses: u32, lived: Option<Duration>) -> u32 {
+    let before = if lived.is_some_and(|d| d >= RELAY_STABLE_AFTER) {
+        0
+    } else {
+        losses
+    };
+    before.saturating_add(1)
+}
+
+/// What a finished dial task hands back: the dialler, so the next attempt can
+/// use it, and what this attempt produced.
+///
+/// **The dialler always comes back.** It holds the relay address and the host's
+/// credential, and a controller that lost it would answer every later
+/// `StartViaRelay` with "no relay is configured" — which is not true, and would
+/// send the operator looking for a setting they never changed.
+type DialResult = (Box<dyn DialOut>, Result<Box<dyn PeerSource>, DialFailure>);
+
+/// A dial-out in progress: connecting right now, or waiting to try again.
+enum DialAttempt {
+    InFlight(JoinHandle<DialResult>),
+    Waiting(Pin<Box<tokio::time::Sleep>>),
+}
+
+/// What the dial arm of the select loop produced.
+enum DialStep {
+    /// An attempt finished, for better or worse.
+    Done(DialResult),
+    /// The backoff elapsed: time for the next attempt.
+    Again,
+    /// The dial task itself died. Only reachable if it panicked — the
+    /// controller never aborts one, because aborting is what would destroy the
+    /// dialler mid-flight.
+    Lost,
+}
+
+/// Await whatever the dial is doing, or never finish when it is doing nothing.
+///
+/// Cancel-safe both ways: a `JoinHandle` polled again after its future was
+/// dropped still yields the task's value, and the `Sleep` is owned here rather
+/// than recreated, so a dropped poll does not restart the backoff.
+async fn dial_step(state: &mut Option<DialAttempt>) -> DialStep {
+    match state {
+        None => std::future::pending().await,
+        Some(DialAttempt::InFlight(task)) => match (&mut *task).await {
+            Ok(result) => DialStep::Done(result),
+            Err(_) => DialStep::Lost,
+        },
+        Some(DialAttempt::Waiting(sleep)) => {
+            sleep.as_mut().await;
+            DialStep::Again
+        }
+    }
+}
+
+/// Await a dial the operator has already stopped waiting for.
+///
+/// A TCP connect to a machine that is not answering takes minutes to fail, and
+/// nothing can un-dial it. So Stop stops the *host* at once — no source is
+/// brought up whatever this returns — and the attempt is left here to finish on
+/// its own. When it does, its connection is dropped immediately, which closes
+/// it and lets the relay free the slot rather than waiting out a keepalive, and
+/// the dialler comes back for the next Start.
+async fn reclaim(stray: &mut Option<JoinHandle<DialResult>>) -> Option<DialResult> {
+    match stray {
+        None => std::future::pending().await,
+        Some(task) => (&mut *task).await.ok(),
+    }
+}
 
 /// Handle to a running controller thread. Dropping it shuts the host down.
 pub struct HostHandle {
@@ -214,14 +298,45 @@ pub(crate) fn auth_outcome(
     }
 }
 
-/// Everything the controller owns while a host is running.
-struct Running {
+/// Which of the host's two ways in a source is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteKind {
+    /// The LAN listener the operator started on an interface.
+    Lan,
+    /// The control connection this host dialled to a relay.
+    Relay,
+}
+
+/// One live way in: its source's accept task and the handles that steer it.
+///
+/// Each route has its OWN pre-auth bound (it lives in its accept task). That is
+/// deliberate: strangers flooding the relay cannot lock the operator out of the
+/// LAN route, or the other way round. The total is at most twice
+/// [`PreAuthLimit::MAX_PENDING`].
+struct Route {
+    kind: RouteKind,
+    /// How this route alone reaches the host: `Bound` or `ViaRelay`.
     reach: Reach,
-    /// Cancels the accept loop and every spawned connection task.
+    /// Cancels this route's accept loop and every connection it accepted.
     cancel: tokio::sync::watch::Sender<bool>,
-    /// Requests cancellation of one connection without affecting the listener.
+    /// Requests cancellation of one connection without affecting the route.
     disconnect: mpsc::UnboundedSender<String>,
+    /// Forwards "this peer authenticated" to the accept task, which is what
+    /// releases its pre-auth slot and cancels its deadline. Sent to every route:
+    /// a route ignores a label it never accepted. The controller loop stays the
+    /// single consumer of the backend's auth channel; this is a forward, not a
+    /// second source of truth.
+    authed: mpsc::UnboundedSender<String>,
     accept: tokio::task::JoinHandle<()>,
+}
+
+/// Everything the controller owns while a host is running.
+///
+/// There is always at least one route. Capture and input belong to the RUN,
+/// not to a route: they come up with the first route and go down with the
+/// last, so adding or losing one route never touches them.
+struct Running {
+    routes: Vec<Route>,
     peers: Vec<String>,
     /// Peers whose connection ENDED before their authentication was handled.
     ///
@@ -230,11 +345,87 @@ struct Running {
     /// is seen. The only entries that linger are connections that died without
     /// ever authenticating, which is the ordinary case and costs one label.
     gone_before_auth: std::collections::HashSet<String>,
-    /// Forwards "this peer authenticated" to the accept task, which is what
-    /// releases its pre-auth slot and cancels its deadline. The controller loop
-    /// stays the single consumer of the backend's auth channel; this is a
-    /// forward, not a second source of truth.
-    authed: mpsc::UnboundedSender<String>,
+    /// The run's channels, kept so a route added later reports into the same
+    /// places as the first. A notification from an earlier run cannot arrive
+    /// on them: every Start installs fresh ones.
+    peer_tx: mpsc::UnboundedSender<PeerSignal>,
+    auth_tx: mpsc::UnboundedSender<String>,
+    notice_tx: mpsc::UnboundedSender<String>,
+}
+
+impl Running {
+    /// How the host is reachable, derived from the routes rather than stored
+    /// beside them — a second field tracking the same fact is a second field
+    /// that can disagree with it.
+    fn reach(&self) -> Reach {
+        let bound = self.routes.iter().find_map(|r| r.reach.bound());
+        let relay = self
+            .routes
+            .iter()
+            .find_map(|r| r.reach.relay().map(|(a, s)| (a, s.to_string())));
+        Reach::from_routes(bound, relay).expect("a running host always has a route")
+    }
+
+    fn has(&self, kind: RouteKind) -> bool {
+        self.routes.iter().any(|r| r.kind == kind)
+    }
+
+    /// The state a running host reports: Pairable with no peers, else
+    /// Connected.
+    fn state(&self) -> HostState {
+        let reach = self.reach();
+        match self.peers.len() {
+            0 => HostState::Pairable { reach },
+            peers => HostState::Connected { reach, peers },
+        }
+    }
+
+    /// Start serving `source` as `kind`, on this run's channels.
+    fn open_route(
+        &self,
+        kind: RouteKind,
+        source: Box<dyn PeerSource>,
+        backend: &mut impl HostBackend,
+    ) -> Route {
+        let reach = source.reach();
+        let (cancel, _) = tokio::sync::watch::channel(false);
+        let (disconnect, disconnect_rx) = mpsc::unbounded_channel::<String>();
+        // The backend is owned by the controller loop, so the accept task
+        // cannot borrow it. It gets a dispatch closure instead: the backend
+        // hands out one connection future per socket and keeps no borrow.
+        let dispatch = backend.dispatch(self.auth_tx.clone(), self.notice_tx.clone());
+        let (authed, authed_rx) = mpsc::unbounded_channel::<String>();
+        let accept = spawn_accept(
+            kind,
+            source,
+            cancel.subscribe(),
+            disconnect_rx,
+            self.peer_tx.clone(),
+            dispatch,
+            authed_rx,
+        );
+        Route {
+            kind,
+            reach,
+            cancel,
+            disconnect,
+            authed,
+            accept,
+        }
+    }
+
+    /// Close one route and wait for its accept task, and every connection it
+    /// accepted, to exit. `false` if the host had no such route.
+    async fn close_route(&mut self, kind: RouteKind) -> bool {
+        let Some(i) = self.routes.iter().position(|r| r.kind == kind) else {
+            return false;
+        };
+        let route = self.routes.remove(i);
+        let _ = route.cancel.send(true);
+        // Bounded: a wedged accept task must not wedge the controller.
+        let _ = tokio::time::timeout(Duration::from_secs(5), route.accept).await;
+        true
+    }
 }
 
 async fn run(
@@ -244,12 +435,26 @@ async fn run(
     evt_tx: mpsc::UnboundedSender<HostEvent>,
 ) {
     let mut running: Option<Running> = None;
-    // Fresh channels are installed for every Start and dropped on Stop. A
+    // Fresh channels are installed for every run and dropped when it ends. A
     // delayed notification from an old connection can therefore never enter a
     // later run.
     let mut peer_rx = None;
     let mut auth_rx = None;
     let mut notice_rx = None;
+    // Whether this controller was BUILT with a relay, which never changes.
+    // `dial_out` goes empty while an attempt is in flight, and "the dialler is
+    // busy" must not be reported as "you have no relay".
+    let relay_configured = dial_out.is_some();
+    let mut dialling: Option<DialAttempt> = None;
+    let mut stray: Option<JoinHandle<DialResult>> = None;
+    // Which attempt of the current dial this is, 1-based. Reset by every new
+    // `StartViaRelay`, so an operator who clicks again gets an immediate
+    // attempt rather than inheriting a minute of someone else's backoff.
+    let mut attempt: u32 = 0;
+    // Relay connections lost in a row, each within RELAY_STABLE_AFTER of the
+    // one before, and when the current one came up.
+    let mut relay_losses: u32 = 0;
+    let mut relay_up_since: Option<std::time::Instant> = None;
 
     // Emitting is also how the controller learns the UI is gone: an unbounded
     // send only fails when the receiver is dropped. That is the "UI-channel
@@ -272,67 +477,162 @@ async fn run(
         }};
     }
 
-    // Everything a Start does once it HAS a source, shared by both routes.
+    // Abandon any dial in progress. An attempt in flight cannot be un-dialled,
+    // so it is left to finish in `stray`, which closes whatever it produces; a
+    // backoff timer is simply dropped.
+    macro_rules! cancel_dial {
+        () => {{
+            attempt = 0;
+            if let Some(DialAttempt::InFlight(task)) = dialling.take() {
+                stray = Some(task);
+            }
+        }};
+    }
+
+    // A start that did not happen. Only a host with nothing else under way is
+    // in Error: one already serving, or still dialling the relay, is exactly
+    // what it was a moment ago, and an Error state would tell the operator it
+    // had stopped.
+    macro_rules! start_failed {
+        ($message:expr) => {{
+            let message: String = $message;
+            emit!(HostEvent::Fault {
+                message: message.clone()
+            });
+            if running.is_none() && dialling.is_none() {
+                set_state!(HostState::Error { message });
+            }
+        }};
+    }
+
+    // The FIRST route of a run: everything a Start does once it has a source,
+    // shared by both routes.
     //
     // Capture and input come up only once a source exists, and either failing
     // tears the source back down — a host that is reachable but cannot serve is
-    // worse than one that plainly did not start.
+    // worse than one that plainly did not start. For the same reason a dial
+    // still in flight is abandoned: it would only bring the same failure back.
     macro_rules! bring_up {
-        ($source:expr) => {{
+        ($kind:expr, $source:expr) => {{
             let source: Box<dyn PeerSource> = $source;
-            let reach = source.reach();
             if let Err(f) = backend.start_capture() {
                 drop(source);
-                emit!(HostEvent::Fault {
-                    message: f.0.clone()
-                });
-                set_state!(HostState::Error { message: f.0 });
+                cancel_dial!();
+                start_failed!(f.0);
                 continue;
             }
             if let Err(f) = backend.open_input() {
                 backend.stop_capture();
                 drop(source);
-                emit!(HostEvent::Fault {
-                    message: f.0.clone()
-                });
-                set_state!(HostState::Error { message: f.0 });
+                cancel_dial!();
+                start_failed!(f.0);
                 continue;
             }
-            let (cancel, _) = tokio::sync::watch::channel(false);
             let (peer_tx, run_peer_rx) = mpsc::unbounded_channel::<PeerSignal>();
             let (auth_tx, run_auth_rx) = mpsc::unbounded_channel::<String>();
             // News from inside a running session. `BackendFault` cannot carry
             // it: it is returned only by start_capture, open_input and
             // create_invite, all of which happen before a peer exists.
             let (notice_tx, run_notice_rx) = mpsc::unbounded_channel::<String>();
-            let (disconnect, disconnect_rx) = mpsc::unbounded_channel::<String>();
-            // The backend is owned by this loop, so the accept task cannot
-            // borrow it. It gets a dispatch closure over a shared handle
-            // instead: the backend hands out one connection future per socket
-            // and keeps no borrow.
-            let dispatch = backend.dispatch(auth_tx.clone(), notice_tx.clone());
-            let (authed_tx, authed_rx) = mpsc::unbounded_channel::<String>();
-            let accept = spawn_accept(
-                source,
-                cancel.subscribe(),
-                disconnect_rx,
+            let mut run = Running {
+                routes: Vec::new(),
+                peers: Vec::new(),
+                gone_before_auth: std::collections::HashSet::new(),
                 peer_tx,
-                dispatch,
-                authed_rx,
-            );
+                auth_tx,
+                notice_tx,
+            };
+            let route = run.open_route($kind, source, &mut backend);
+            run.routes.push(route);
             peer_rx = Some(run_peer_rx);
             auth_rx = Some(run_auth_rx);
             notice_rx = Some(run_notice_rx);
-            running = Some(Running {
-                reach: reach.clone(),
-                authed: authed_tx,
-                cancel,
-                disconnect,
-                accept,
-                peers: Vec::new(),
-                gone_before_auth: std::collections::HashSet::new(),
+            let state = run.state();
+            running = Some(run);
+            set_state!(state);
+        }};
+    }
+
+    // A second way in for a host that is ALREADY serving. Capture and input
+    // are up already, and the outstanding invite still names a live route, so
+    // it stands.
+    macro_rules! add_route {
+        ($kind:expr, $source:expr) => {{
+            let source: Box<dyn PeerSource> = $source;
+            if let Some(r) = running.as_mut() {
+                let route = r.open_route($kind, source, &mut backend);
+                r.routes.push(route);
+            }
+            let state = running.as_ref().map(Running::state);
+            if let Some(state) = state {
+                set_state!(state);
+            }
+        }};
+    }
+
+    // One route of a host that keeps serving on the other is gone, or closed.
+    //
+    // The outstanding invite may name the route that went, and the controller
+    // does not know which routes it names, so it is revoked rather than
+    // guessed about: a code for a dead route is a credential outliving the
+    // thing it granted access to.
+    macro_rules! lose_route {
+        ($kind:expr) => {{
+            if let Some(r) = running.as_mut() {
+                r.close_route($kind).await;
+            }
+            backend.revoke_invite();
+            emit!(HostEvent::InviteWithdrawn);
+            let state = running.as_ref().map(Running::state);
+            if let Some(state) = state {
+                set_state!(state);
+            }
+        }};
+    }
+
+    // Dial the relay again after its connection ended. Scheduled rather than
+    // started inline, with the loss counted, so a relay that keeps dropping
+    // the host is dialled at 0, 1, 2, 4 … 60 s intervals instead of in a loop.
+    // RelayRetrying is emitted even for the immediate first attempt: the
+    // operator's question is "is it coming back", and silence reads as "no".
+    macro_rules! redial_after_loss {
+        ($why:expr) => {{
+            relay_losses =
+                next_relay_losses(relay_losses, relay_up_since.take().map(|t| t.elapsed()));
+            let delay = retry_delay(relay_losses);
+            emit!(HostEvent::RelayRetrying {
+                attempt: relay_losses,
+                in_seconds: delay.as_secs(),
+                why: $why,
             });
-            set_state!(HostState::Pairable { reach });
+            attempt = 0;
+            dialling = Some(DialAttempt::Waiting(Box::pin(tokio::time::sleep(delay))));
+        }};
+    }
+
+    // Begin one dial attempt, on its own task.
+    //
+    // **Not awaited here.** Dialling a relay that is not answering takes as
+    // long as a TCP connect takes, and this loop is the only thing that reads
+    // the command channel: awaiting it inline is a console whose Stop button
+    // does nothing for two minutes.
+    macro_rules! start_dial {
+        () => {{
+            let Some(mut dialler) = dial_out.take() else {
+                // Unreachable through the command paths, which all check first.
+                // Stated rather than unwrapped: a panic here takes the whole
+                // host down, including a session that is serving.
+                emit!(HostEvent::Fault {
+                    message: "the previous relay attempt has not finished — try again in a moment"
+                        .into(),
+                });
+                continue;
+            };
+            attempt += 1;
+            dialling = Some(DialAttempt::InFlight(tokio::spawn(async move {
+                let result = dialler.connect().await;
+                (dialler, result)
+            })));
         }};
     }
 
@@ -346,9 +646,12 @@ async fn run(
                 };
                 match cmd {
                     HostCommand::Start { bind } => {
-                        if running.is_some() {
+                        // One listener at a time. Moving to another interface is
+                        // Stop listening then Start, so the old socket is
+                        // provably gone before the new one appears.
+                        if running.as_ref().is_some_and(|r| r.has(RouteKind::Lan)) {
                             emit!(HostEvent::Fault {
-                                message: "already running — Stop before starting again".into(),
+                                message: "already listening — stop listening before starting on another interface".into(),
                             });
                             continue;
                         }
@@ -359,31 +662,37 @@ async fn run(
                                 continue;
                             }
                         };
-                        set_state!(HostState::Starting);
+                        // A host serving through the relay stays Pairable or
+                        // Connected while the listener comes up beside it; only
+                        // a host with nothing running is Starting.
+                        if running.is_none() {
+                            set_state!(HostState::Starting);
+                        }
                         let listener = match tokio::net::TcpListener::bind(addr).await {
                             Ok(l) => l,
                             Err(e) => {
-                                let message = format!("could not bind: {}", e.kind());
-                                emit!(HostEvent::Fault { message: message.clone() });
-                                set_state!(HostState::Error { message });
+                                start_failed!(format!("could not bind: {}", e.kind()));
                                 continue;
                             }
                         };
                         let bound = match listener.local_addr() {
                             Ok(a) => a,
                             Err(e) => {
-                                let message = format!("bound socket has no address: {}", e.kind());
-                                emit!(HostEvent::Fault { message: message.clone() });
-                                set_state!(HostState::Error { message });
+                                start_failed!(format!("bound socket has no address: {}", e.kind()));
                                 continue;
                             }
                         };
-                        bring_up!(Box::new(ListenSource::new(listener, bound)));
+                        let source = Box::new(ListenSource::new(listener, bound));
+                        if running.is_some() {
+                            add_route!(RouteKind::Lan, source);
+                        } else {
+                            bring_up!(RouteKind::Lan, source);
+                        }
                     }
                     HostCommand::StartViaRelay => {
-                        if running.is_some() {
+                        if running.as_ref().is_some_and(|r| r.has(RouteKind::Relay)) {
                             emit!(HostEvent::Fault {
-                                message: "already running — Stop before starting again".into(),
+                                message: "already connected to the relay".into(),
                             });
                             continue;
                         }
@@ -391,26 +700,69 @@ async fn run(
                         // than inventing a route. There is no fallback to
                         // binding: the two are different exposures and the
                         // operator chose one.
-                        let Some(dialler) = dial_out.as_mut() else {
+                        if !relay_configured {
                             emit!(HostEvent::Fault {
                                 message: "no relay is configured — this host cannot dial out".into(),
                             });
                             continue;
+                        }
+                        // Already dialling. Not a fault worth an Error state:
+                        // the thing the operator asked for is already happening,
+                        // and tearing it down to start it again would only add
+                        // a minute.
+                        if dialling.is_some() {
+                            emit!(HostEvent::Fault {
+                                message: "already connecting to the relay".into(),
+                            });
+                            continue;
+                        }
+                        // The dialler is still inside an attempt the operator
+                        // stopped. Distinct from having no relay at all, which
+                        // would send them looking for a setting they never
+                        // changed.
+                        if dial_out.is_none() {
+                            emit!(HostEvent::Fault {
+                                message: "the previous relay connection is still closing — try again in a moment"
+                                    .into(),
+                            });
+                            continue;
+                        }
+                        if running.is_none() {
+                            set_state!(HostState::Starting);
+                        }
+                        attempt = 0;
+                        relay_losses = 0;
+                        start_dial!();
+                    }
+                    HostCommand::StopListening => {
+                        let refusal = match running.as_ref() {
+                            None => Some("not running"),
+                            Some(r) if !r.has(RouteKind::Lan) => Some("not listening"),
+                            Some(r) if r.routes.len() == 1 => Some(
+                                "the listener is this host's only route — use Stop to stop the host",
+                            ),
+                            Some(_) => None,
                         };
-                        set_state!(HostState::Starting);
-                        let source = match dialler.connect().await {
-                            Ok(s) => s,
-                            Err(message) => {
-                                emit!(HostEvent::Fault { message: message.clone() });
-                                set_state!(HostState::Error { message });
-                                continue;
-                            }
-                        };
-                        bring_up!(source);
+                        if let Some(message) = refusal {
+                            emit!(HostEvent::Fault { message: message.into() });
+                            continue;
+                        }
+                        lose_route!(RouteKind::Lan);
                     }
                     HostCommand::Stop => {
+                        // Stop while still connecting. The operator gets what
+                        // they asked for NOW: nothing will be brought up, and
+                        // the state says Stopped rather than Starting.
+                        let was_dialling = dialling.is_some();
+                        cancel_dial!();
+                        relay_losses = 0;
+                        relay_up_since = None;
                         if running.is_none() {
-                            emit!(HostEvent::Fault { message: "not running".into() });
+                            if was_dialling {
+                                set_state!(HostState::Stopped);
+                            } else {
+                                emit!(HostEvent::Fault { message: "not running".into() });
+                            }
                             continue;
                         }
                         set_state!(HostState::Stopping);
@@ -421,7 +773,7 @@ async fn run(
                         set_state!(HostState::Stopped);
                     }
                     HostCommand::CreateInvite => {
-                        // An invite names an address, so there must be one. The
+                        // An invite names a route, so there must be one. The
                         // previous implementation had no such requirement and
                         // discovered an address by probing a public resolver.
                         let Some(r) = running.as_ref() else {
@@ -434,7 +786,7 @@ async fn run(
                         // Nothing here discovers, guesses or probes for an
                         // endpoint — v3 did, by opening a UDP socket to a public
                         // resolver, and advertised what came back.
-                        let reach = r.reach.clone();
+                        let reach = r.reach();
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs())
@@ -446,9 +798,15 @@ async fn run(
                     }
                     HostCommand::RevokePeer { peer } => {
                         // A live disconnect. Durable revocation is Block 9.
-                        match running.as_mut() {
+                        // Every route is asked; only the one that accepted the
+                        // peer holds it.
+                        match running.as_ref() {
                             Some(r) if r.peers.iter().any(|p| *p == peer) => {
-                                if r.disconnect.send(peer).is_err() {
+                                let mut sent = false;
+                                for route in &r.routes {
+                                    sent |= route.disconnect.send(peer.clone()).is_ok();
+                                }
+                                if !sent {
                                     emit!(HostEvent::Fault {
                                         message: "connection task is no longer available".into(),
                                     });
@@ -463,10 +821,97 @@ async fn run(
                         if running.is_some() {
                             set_state!(HostState::Stopping);
                         }
+                        // The process is ending, so an unfinished dial is
+                        // abandoned rather than waited for: the OS closes its
+                        // socket, and a host that took two minutes to quit
+                        // because a relay was not answering would be a worse
+                        // bug than the one this avoids.
+                        if let Some(DialAttempt::InFlight(task)) = dialling.take() {
+                            task.abort();
+                        }
+                        if let Some(task) = stray.take() {
+                            task.abort();
+                        }
                         teardown(&mut backend, &mut running).await;
                         let _ = evt_tx.send(HostEvent::StateChanged(HostState::Stopped));
                         return;
                     }
+                }
+            }
+            // A dial attempt finished, or its backoff elapsed.
+            step = dial_step(&mut dialling) => {
+                match step {
+                    DialStep::Again => {
+                        dialling = None;
+                        start_dial!();
+                    }
+                    DialStep::Lost => {
+                        dialling = None;
+                        start_failed!("the relay connection task ended unexpectedly".to_string());
+                    }
+                    DialStep::Done((dialler, result)) => {
+                        dialling = None;
+                        dial_out = Some(dialler);
+                        match result {
+                            Ok(source) => {
+                                attempt = 0;
+                                relay_up_since = Some(std::time::Instant::now());
+                                if running.is_some() {
+                                    add_route!(RouteKind::Relay, source);
+                                } else {
+                                    bring_up!(RouteKind::Relay, source);
+                                }
+                            }
+                            // Worth another go: the relay was unreachable, not
+                            // unwilling. A host with nothing running stays
+                            // `Starting`, because that is what is happening — an
+                            // `Error` here would tell the operator the attempt
+                            // was over while the host was still trying.
+                            Err(failure) if failure.worth_retrying() => {
+                                let delay = retry_delay(attempt + 1);
+                                emit!(HostEvent::RelayRetrying {
+                                    attempt,
+                                    in_seconds: delay.as_secs(),
+                                    why: failure.message,
+                                });
+                                dialling = Some(DialAttempt::Waiting(Box::pin(
+                                    tokio::time::sleep(delay),
+                                )));
+                            }
+                            // The relay answered and said no. Retrying would
+                            // hammer it with a credential it has already
+                            // rejected, and each attempt would overwrite the
+                            // reason before the operator could read it.
+                            //
+                            // Its own event, not a Fault: "the relay refused
+                            // this host" needs a human, and "the relay is
+                            // unreachable, retrying" does not. The console has
+                            // to be able to tell them apart without reading
+                            // the text of a message.
+                            Err(failure) => {
+                                attempt = 0;
+                                relay_losses = 0;
+                                emit!(HostEvent::RelayRefused {
+                                    why: failure.message.clone(),
+                                });
+                                if running.is_none() && dialling.is_none() {
+                                    set_state!(HostState::Error { message: failure.message });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // A dial the operator already stopped waiting for came back.
+            reclaimed = reclaim(&mut stray) => {
+                stray = None;
+                if let Some((dialler, result)) = reclaimed {
+                    dial_out = Some(dialler);
+                    // Dropping the source closes the control connection it
+                    // registered with, so the relay frees the slot now instead
+                    // of at its next keepalive. Nothing is reported: the
+                    // operator stopped this, and it did what they asked.
+                    drop(result.ok());
                 }
             }
             // A peer AUTHENTICATED. This is the only path to Connected.
@@ -476,27 +921,28 @@ async fn run(
                     continue;
                 };
                 let Some(r) = running.as_mut() else { continue };
-                match auth_outcome(&r.peers, &r.gone_before_auth, &peer) {
-                    AuthOutcome::Duplicate => continue,
-                    AuthOutcome::AlreadyGone => {
-                        // The socket is already closed. Releasing the pre-auth
-                        // slot is still correct and harmless — the receiver is
-                        // gone — but announcing would strand a Connected row.
-                        r.gone_before_auth.remove(&peer);
-                        let _ = r.authed.send(peer);
-                        continue;
-                    }
-                    AuthOutcome::Announce => {}
+                let outcome = auth_outcome(&r.peers, &r.gone_before_auth, &peer);
+                if outcome == AuthOutcome::Duplicate {
+                    continue;
                 }
                 // Release the pre-auth slot and cancel the deadline BEFORE
                 // announcing the peer: an authenticated session must never be
                 // torn down by a bound meant for strangers.
-                let _ = r.authed.send(peer.clone());
+                for route in &r.routes {
+                    let _ = route.authed.send(peer.clone());
+                }
+                if outcome == AuthOutcome::AlreadyGone {
+                    // The socket is already closed. Releasing the pre-auth
+                    // slot is still correct and harmless — the receiver is
+                    // gone — but announcing would strand a Connected row.
+                    r.gone_before_auth.remove(&peer);
+                    continue;
+                }
                 r.peers.push(peer.clone());
                 let count = r.peers.len();
-                let reach = r.reach.clone();
+                let state = r.state();
                 emit!(HostEvent::PeerConnected { peer, count });
-                set_state!(HostState::Connected { reach, peers: count });
+                set_state!(state);
             }
             // A running session has something the OPERATOR needs to see. The
             // case this exists for is the Windows UIPI refusal: the host gives
@@ -524,14 +970,68 @@ async fn run(
             signal = receive_if_running(&mut peer_rx) => {
                 let peer = match signal {
                     Some(PeerSignal::Gone(peer)) => peer,
-                    Some(PeerSignal::SourceEnded(why)) => {
-                        set_state!(HostState::Stopping);
-                        teardown(&mut backend, &mut running).await;
-                        peer_rx = None;
-                        auth_rx = None;
-                        notice_rx = None;
-                        emit!(HostEvent::Fault { message: why.clone() });
-                        set_state!(HostState::Error { message: why });
+                    Some(PeerSignal::SourceEnded(kind, why)) => {
+                        // A route this host no longer has — closed on purpose
+                        // while its end was already on the way — is history.
+                        let Some(r) = running.as_ref() else { continue };
+                        if !r.has(kind) {
+                            continue;
+                        }
+                        if r.routes.len() == 1 && kind == RouteKind::Relay {
+                            // The relay was this host's only way in, and the
+                            // operator chose to be reachable through it: losing
+                            // it is an outage to recover from, not a decision to
+                            // stop. Found 2026-09-17, when a host lost its relay
+                            // at 09:32 and was unreachable for ten hours.
+                            //
+                            // Capture and input go with the run — a host with no
+                            // route must hold neither — and come back with the
+                            // relay. The code on screen named this session, so it
+                            // is withdrawn, and a relay that refuses the next
+                            // dial ends the attempt with the refusal named.
+                            emit!(HostEvent::Fault {
+                                message: format!("{why} — reconnecting"),
+                            });
+                            teardown(&mut backend, &mut running).await;
+                            peer_rx = None;
+                            auth_rx = None;
+                            notice_rx = None;
+                            emit!(HostEvent::InviteWithdrawn);
+                            set_state!(HostState::Starting);
+                            redial_after_loss!(why);
+                            continue;
+                        }
+                        if r.routes.len() == 1 {
+                            // The LAST way in is gone and it was the listener:
+                            // the run is over, as it always was. A listener is
+                            // never reopened — starting one is the operator's
+                            // decision.
+                            cancel_dial!();
+                            set_state!(HostState::Stopping);
+                            teardown(&mut backend, &mut running).await;
+                            peer_rx = None;
+                            auth_rx = None;
+                            notice_rx = None;
+                            emit!(HostEvent::Fault { message: why.clone() });
+                            set_state!(HostState::Error { message: why });
+                            continue;
+                        }
+                        // The other route is still serving, so the host stays
+                        // up and says what it lost.
+                        let still = match kind {
+                            RouteKind::Relay => "reconnecting; still reachable on the LAN",
+                            RouteKind::Lan => "still reachable through the relay",
+                        };
+                        emit!(HostEvent::Fault { message: format!("{why} — {still}") });
+                        lose_route!(kind);
+                        // A relay drop on a laptop that changed network is
+                        // ordinary, and the operator already chose to be
+                        // reachable through it: dial again, with the usual
+                        // backoff. A lost listener is not reopened — starting
+                        // one is always the operator's decision.
+                        if kind == RouteKind::Relay && dialling.is_none() {
+                            redial_after_loss!(why);
+                        }
                         continue;
                     }
                     None => {
@@ -551,13 +1051,9 @@ async fn run(
                 };
                 r.peers.remove(i);
                 let count = r.peers.len();
-                let reach = r.reach.clone();
+                let state = r.state();
                 emit!(HostEvent::PeerDisconnected { peer, count });
-                if count == 0 {
-                    set_state!(HostState::Pairable { reach });
-                } else {
-                    set_state!(HostState::Connected { reach, peers: count });
-                }
+                set_state!(state);
             }
         }
     }
@@ -719,10 +1215,11 @@ enum PeerSignal {
     /// one does not. Without this the host would keep reporting `Pairable`
     /// while nothing could ever reach it, and the invite already issued would
     /// name a session the relay has released.
-    SourceEnded(String),
+    SourceEnded(RouteKind, String),
 }
 
 fn spawn_accept(
+    kind: RouteKind,
     mut source: Box<dyn PeerSource>,
     mut cancel: tokio::sync::watch::Receiver<bool>,
     mut disconnect: mpsc::UnboundedReceiver<String>,
@@ -769,9 +1266,11 @@ fn spawn_accept(
                         // and stop: a loop that kept selecting on a dead source
                         // would spin, and a host that kept reporting Pairable
                         // would be lying about being reachable.
-                        let _ = peers.send(PeerSignal::SourceEnded(
-                            "the host's route to clients closed".to_string(),
-                        ));
+                        let why = match kind {
+                            RouteKind::Lan => "the LAN listener closed",
+                            RouteKind::Relay => "the relay connection closed",
+                        };
+                        let _ = peers.send(PeerSignal::SourceEnded(kind, why.to_string()));
                         break;
                     };
 
@@ -869,14 +1368,60 @@ async fn teardown(backend: &mut impl HostBackend, running: &mut Option<Running>)
     // can block.
     backend.close_input();
     if let Some(r) = running.take() {
-        let _ = r.cancel.send(true);
+        for route in &r.routes {
+            let _ = route.cancel.send(true);
+        }
         // Bounded: a wedged accept task must not stop the process from exiting.
-        let _ = tokio::time::timeout(Duration::from_secs(5), r.accept).await;
+        let accepts: Vec<_> = r.routes.into_iter().map(|route| route.accept).collect();
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            for accept in accepts {
+                let _ = accept.await;
+            }
+        })
+        .await;
     }
     // Every session producer is gone, so none can race this release by asking
     // the shared platform capturer for one more frame.
     backend.stop_capture();
 }
+#[cfg(test)]
+mod relay_loss_tests {
+    use super::*;
+
+    /// A relay that keeps dropping the host backs off; one that held for a
+    /// while and then dropped starts the schedule again at "immediately".
+    #[test]
+    fn short_lived_relay_connections_extend_the_backoff_and_a_stable_one_resets_it() {
+        let quick = Some(Duration::from_secs(2));
+        let stable = Some(RELAY_STABLE_AFTER);
+        assert_eq!(next_relay_losses(0, quick), 1);
+        assert_eq!(next_relay_losses(1, quick), 2);
+        assert_eq!(next_relay_losses(5, quick), 6);
+        // A connection that never came up counts as short-lived.
+        assert_eq!(next_relay_losses(3, None), 4);
+        assert_eq!(
+            next_relay_losses(7, stable),
+            1,
+            "a stable connection did not reset the run"
+        );
+        assert_eq!(
+            next_relay_losses(u32::MAX, quick),
+            u32::MAX,
+            "the count must not overflow"
+        );
+        // And the schedule those counts produce: now, then 1, 2, 4 … capped.
+        assert_eq!(retry_delay(next_relay_losses(0, quick)), Duration::ZERO);
+        assert_eq!(
+            retry_delay(next_relay_losses(1, quick)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            retry_delay(next_relay_losses(2, quick)),
+            Duration::from_secs(2)
+        );
+    }
+}
+
 #[cfg(test)]
 mod session_limit_tests {
     use super::*;

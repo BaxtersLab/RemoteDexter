@@ -44,6 +44,8 @@ pub enum Action {
     ReuseLast,
     /// Report a fault. Never dress a stale frame as a live one.
     Fault,
+    /// Nothing to serve yet, and nothing wrong: keep the stream and ask again.
+    AwaitFirst,
 }
 
 /// Decide what to do, given what was seen and whether a previous frame exists.
@@ -57,9 +59,14 @@ pub const fn action(observed: Observation, has_last_frame: bool) -> Action {
             if has_last_frame {
                 Action::ReuseLast
             } else {
-                // Nothing new and nothing to fall back on: there is no honest
-                // frame to serve.
-                Action::Fault
+                // Nothing new and nothing to fall back on — but the stream is
+                // alive, so this is a still desktop, not a broken capture. It
+                // used to be a Fault: a rebuilt capture on a desktop nobody was
+                // touching got no buffer within its 2 s wait, and the stream
+                // was ended with "permission denied" (2026-09-18, 13:07 and
+                // 21:20). There is still no frame to serve, so none is served;
+                // the caller waits for the first one.
+                Action::AwaitFirst
             }
         }
     }
@@ -96,9 +103,14 @@ mod tests {
         assert_eq!(action(Observation::Quiet, true), Action::ReuseLast);
     }
 
+    /// Changed 2026-09-18. This test used to require a Fault here, and that
+    /// rule is what ended a live stream over a still desktop — twice in one
+    /// day, on the first frame of a session started while nobody was at the
+    /// host. A quiet, living stream with no first frame is waited on.
     #[test]
-    fn a_quiet_stream_with_nothing_to_reuse_faults() {
-        assert_eq!(action(Observation::Quiet, false), Action::Fault);
+    fn a_quiet_stream_with_no_first_frame_waits_for_one() {
+        assert_eq!(action(Observation::Quiet, false), Action::AwaitFirst);
+        assert_ne!(action(Observation::Quiet, false), Action::Fault);
     }
 
     #[test]

@@ -1,0 +1,28 @@
+# fail2ban jail for relayd. A file of its own: never an edit to jail.local.
+#
+# 3 trigger lines from one address within 10 minutes -> banned from TCP 9443 for
+# 1 hour. A repeat ban from the same address is 24 hours, then 7 days, and stays
+# at 7 days (bantime * multipliers[earlier bans], capped by maxtime; fail2ban 1.0.2
+# server/jail.py setBanTimeExtra and server/observer.py incrBanTime).
+#
+# Escalation reads earlier bans from fail2ban's database, so it survives restarts
+# but only as far back as dbpurgeage (default 1d, in fail2ban.conf / fail2ban.local).
+#
+# NO action line: the default banaction applies to port 9443 only. Never an
+# all-ports ban and never a notification action — root fail2ban must not execute
+# anyone's code; an external watcher reads fail2ban's own log instead.
+
+[remotedexter-relay]
+enabled      = true
+backend      = systemd
+journalmatch = _SYSTEMD_UNIT=remotedexter-relay.service
+filter       = remotedexter-relay
+port         = 9443
+protocol     = tcp
+maxretry     = 3
+findtime     = 10m
+bantime      = 1h
+bantime.increment   = true
+bantime.multipliers = 1 24 168
+bantime.maxtime     = 7d
+usedns       = no

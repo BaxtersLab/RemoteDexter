@@ -49,7 +49,7 @@ are System Libraries and general-purpose tools under §1.
 
 ### Where to get it
 
-- **Distribution URL:** `https://baxters.vip/remotedexter/`
+- **Distribution URL:** `https://github.com/BaxtersLab/RemoteDexter`
 - **Contact for source requests**, should a download ever be unreachable:
   `baxtersbeats@outlook.com` — the same address carried in the `.deb`
   `Maintainer` field.

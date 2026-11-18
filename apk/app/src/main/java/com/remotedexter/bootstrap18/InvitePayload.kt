@@ -112,20 +112,23 @@ data class InvitePayload(
                         host_identity_pubkey = invite.hostIdentityPubkey
                     )
                 }
-                // A v5 invite names a RELAY and a session, and carries no host
-                // address at all. [InvitePayload] is built around `lan_ip` and
-                // `port`, so representing one here would mean inventing an
-                // address the host is not listening on — the same mistake v3
-                // made when it probed a public resolver for a "public" one.
+                // v5 and v6 name a relay route, and [InvitePayload] is built
+                // around `lan_ip` and `port` alone: representing either here
+                // would drop the relay, and for v5 would mean inventing an
+                // address the host is not listening on — the mistake v3 made
+                // when it probed a public resolver for a "public" one.
                 //
-                // Refused by name instead. Teaching the client to open a relay
-                // session is its own piece of work; until it exists, a v5 QR is
-                // a code this build genuinely cannot act on, and saying so is
-                // the only honest answer.
+                // Neither should ever reach this decoder. `QrScanActivity`
+                // routes both to their own starters first, so arriving here
+                // means that routing was bypassed, and the refusal says so
+                // rather than connecting by the wrong rules.
                 is Decoded.V5 -> throw InviteDecodeException(
                     FailureReason.InviteParse,
-                    "this pairing code is for a host reached through a relay, " +
-                        "which this build cannot connect to yet"
+                    "this pairing code names a relay and was given to the wrong reader"
+                )
+                is Decoded.V6 -> throw InviteDecodeException(
+                    FailureReason.InviteParse,
+                    "this pairing code names two routes and was given to the wrong reader"
                 )
                 is Decoded.SeparatorInField -> throw InviteDecodeException(
                     FailureReason.InviteParse,

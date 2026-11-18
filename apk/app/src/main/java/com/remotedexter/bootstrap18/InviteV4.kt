@@ -79,6 +79,32 @@ data class InviteV5(
     val signature: String
 )
 
+/**
+ * The v6 pairing invite: a host serving BOTH routes at once — bound to an
+ * interface and dialled out to a relay.
+ *
+ * Every field of [InviteV4] and every field of [InviteV5], always all of them,
+ * and ONE token: the phone races the two routes and presents the token only on
+ * the route whose pinned handshake completes first.
+ */
+data class InviteV6(
+    val kind: String,
+    val version: Int,
+    val protocol: String,
+    val addr: String,
+    val port: Int,
+    val relayAddr: String,
+    val relayPort: Int,
+    val session: String,
+    val token: String,
+    val nonce: String,
+    val expiresAt: Long,
+    val capabilities: List<String>,
+    val hostPubkey: String,
+    val hostIdentityPubkey: String,
+    val signature: String
+)
+
 /** A v3 invite, kept for one migration release. */
 data class InviteV3(
     val addr: String,
@@ -94,6 +120,8 @@ data class InviteV3(
 
 /** Outcome of decoding scanned QR text. */
 sealed class Decoded {
+    /** A host reachable both on the LAN and through a relay. */
+    data class V6(val invite: InviteV6) : Decoded()
     /** A host reached through a relay. */
     data class V5(val invite: InviteV5) : Decoded()
     /** A host bound to an interface. */
@@ -130,6 +158,12 @@ object InviteDecoder {
      */
     const val RELAY_INVITE_VERSION = 5
 
+    /**
+     * The invite schema for a host serving BOTH routes. Always both: a host with
+     * one route still mints v4 or v5, which every app can read.
+     */
+    const val DUAL_INVITE_VERSION = 6
+
     const val LEGACY_INVITE_VERSION = 3
 
     /** The character that separates fields in the canonical encoding. */
@@ -163,6 +197,7 @@ object InviteDecoder {
         return when (val version = obj.optInt("version", LEGACY_INVITE_VERSION)) {
             INVITE_VERSION -> decodeV4(obj)
             RELAY_INVITE_VERSION -> decodeV5(obj)
+            DUAL_INVITE_VERSION -> decodeV6(obj)
             LEGACY_INVITE_VERSION -> decodeV3(obj)
             else -> Decoded.UnsupportedVersion(version)
         }
@@ -235,6 +270,63 @@ object InviteDecoder {
 
         separatorInField(invite)?.let { return Decoded.SeparatorInField(it) }
         return Decoded.V5(invite)
+    }
+
+    private fun decodeV6(obj: JSONObject): Decoded {
+        val kind = obj.optString("kind", "")
+        if (kind != INVITE_KIND) return Decoded.WrongKind(kind)
+
+        // Both routes are required. A v6 missing either is Malformed — never
+        // quietly read as the route it happened to keep.
+        for (required in listOf(
+            "protocol", "addr", "port", "relay_addr", "relay_port", "session", "token",
+            "nonce", "expires_at", "capabilities", "host_pubkey", "host_identity_pubkey",
+            "signature"
+        )) {
+            if (!obj.has(required)) return Decoded.Malformed(required)
+        }
+
+        val capsArray = obj.optJSONArray("capabilities") ?: return Decoded.Malformed("capabilities")
+        val caps = ArrayList<String>(capsArray.length())
+        for (i in 0 until capsArray.length()) caps.add(capsArray.getString(i))
+
+        val invite = InviteV6(
+            kind = kind,
+            version = DUAL_INVITE_VERSION,
+            protocol = obj.getString("protocol"),
+            addr = obj.getString("addr"),
+            port = obj.getInt("port"),
+            relayAddr = obj.getString("relay_addr"),
+            relayPort = obj.getInt("relay_port"),
+            session = obj.getString("session"),
+            token = obj.getString("token"),
+            nonce = obj.getString("nonce"),
+            expiresAt = obj.getLong("expires_at"),
+            capabilities = caps,
+            hostPubkey = obj.getString("host_pubkey"),
+            hostIdentityPubkey = obj.getString("host_identity_pubkey"),
+            signature = obj.getString("signature")
+        )
+
+        separatorInField(invite)?.let { return Decoded.SeparatorInField(it) }
+        return Decoded.V6(invite)
+    }
+
+    /** The first field that would break the canonical encoding, if any. */
+    private fun separatorInField(i: InviteV6): String? {
+        for ((name, value) in listOf(
+            "kind" to i.kind,
+            "protocol" to i.protocol,
+            "addr" to i.addr,
+            "relay_addr" to i.relayAddr,
+            "session" to i.session,
+            "token" to i.token,
+            "nonce" to i.nonce,
+            "host_pubkey" to i.hostPubkey
+        )) {
+            if (fieldCarriesSeparator(value)) return name
+        }
+        return if (i.capabilities.any { fieldCarriesSeparator(it) }) "capabilities" else null
     }
 
     /** The first field that would break the canonical encoding, if any. */
@@ -355,6 +447,34 @@ object InviteDecoder {
 
     /** True when the v5 invite has already expired at [nowEpochSeconds]. */
     fun isExpired(i: InviteV5, nowEpochSeconds: Long): Boolean = nowEpochSeconds >= i.expiresAt
+
+    /**
+     * The exact bytes a v6 signature covers.
+     *
+     * **Must match `pairing::invite::dual_canonical_bytes` byte for byte.** The
+     * LAN route sits where v4 has it and the relay route follows it in v5's
+     * order, so each route is signed as a unit. Field order is load-bearing and
+     * is not alphabetical. `contract/signed_invite_v6.json` catches drift.
+     */
+    fun canonicalBytesV6(i: InviteV6): ByteArray =
+        listOf(
+            i.kind,
+            i.version.toString(),
+            i.protocol,
+            i.addr,
+            i.port.toString(),
+            i.relayAddr,
+            i.relayPort.toString(),
+            i.session,
+            i.token,
+            i.nonce,
+            i.expiresAt.toString(),
+            i.capabilities.joinToString(","),
+            i.hostPubkey
+        ).joinToString("\n").toByteArray(Charsets.UTF_8)
+
+    /** True when the v6 invite has already expired at [nowEpochSeconds]. */
+    fun isExpired(i: InviteV6, nowEpochSeconds: Long): Boolean = nowEpochSeconds >= i.expiresAt
 
     /** v3's canonical bytes, reproduced exactly as the old host produced them. */
     fun canonicalBytesV3(i: InviteV3): ByteArray =

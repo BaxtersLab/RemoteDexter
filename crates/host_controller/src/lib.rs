@@ -47,5 +47,5 @@ pub use bind::{validate as validate_bind, BindRejection};
 pub use controller::{
     spawn, spawn_with, spawn_with_dial_out, HostHandle, PreAuthLimit, SessionLimit,
 };
-pub use source::{DialOut, ListenSource, Peer, PeerSource};
+pub use source::{DialFailure, DialOut, ListenSource, Peer, PeerSource, RetryAdvice};
 pub use state::{HostCommand, HostEvent, HostState, Reach};

@@ -178,15 +178,13 @@ impl ClientReach {
     /// it does not hold.
     async fn open(&self) -> Result<TcpStream> {
         match self {
-            ClientReach::Direct { host, port } => {
-                Ok(TcpStream::connect((host.as_str(), *port)).await?)
-            }
+            ClientReach::Direct { host, port } => connect_for_session(host, *port).await,
             ClientReach::ViaRelay {
                 relay,
                 relay_port,
                 session,
             } => {
-                let mut stream = TcpStream::connect((relay.as_str(), *relay_port)).await?;
+                let mut stream = connect_for_session(relay, *relay_port).await?;
                 relay_join(&mut stream, session).await?;
                 Ok(stream)
             }
@@ -206,6 +204,20 @@ impl ClientReach {
             } => format!("relay {relay}:{relay_port}"),
         }
     }
+}
+
+/// Connect a session socket with Nagle's algorithm off.
+///
+/// Measured on the operator's phone over weak Wi-Fi, 2026-09-14: input is a
+/// stream of small messages, and with Nagle on each one waits for the peer to
+/// acknowledge whatever this phone sent before it — so on a lossy link, where
+/// acknowledgements are exactly what goes missing, every keystroke queues
+/// behind the last. A remote desktop wants each event on the wire as it
+/// happens. The host sets the same option on its side.
+async fn connect_for_session(host: &str, port: u16) -> Result<TcpStream> {
+    let stream = TcpStream::connect((host, port)).await?;
+    stream.set_nodelay(true)?;
+    Ok(stream)
 }
 
 /// Ask the relay to splice this connection to `session`.
@@ -342,6 +354,57 @@ impl PinnedNoiseSession {
     ) -> Result<Self> {
         Self::connect_inner(
             ClientReach::Direct { host, port },
+            String::new(),
+            expected_host_pub,
+        )
+        .await
+    }
+
+    /// Reconnect THROUGH A RELAY as a device the host has already enrolled —
+    /// **no token**.
+    ///
+    /// [`connect_paired`] for the relay route, and a separate named call for the
+    /// same reason that one is: the token-less path has to be meant, and must
+    /// not be reachable by an invite whose token failed to parse.
+    ///
+    /// ## Why this became possible
+    ///
+    /// The relay used to issue a random session id per registration, so a host
+    /// restart killed the id the phone had paired against and there was nothing
+    /// to reconnect to. An enrolled host now gets the same id every time it
+    /// registers, for as long as the relay runs, so the id the phone kept from
+    /// its pairing still names that host after the host restarts.
+    ///
+    /// It does NOT survive a restart of the RELAY: the relay derives ids through
+    /// a key it keeps only in memory. A stored id refused after that is
+    /// indistinguishable, from here, from a host that is not running — the relay
+    /// gives both the same answer on purpose — and the remedy for both is on the
+    /// host side.
+    ///
+    /// ## What authenticates, and what the relay learns
+    ///
+    /// Exactly as [`connect_paired`]: the device's own Noise static key, and the
+    /// host key pinned in the handshake. The relay sees the session id it issued
+    /// and then ciphertext, and a relay that spliced this connection to a machine
+    /// of its own choosing fails at the pin.
+    pub async fn connect_paired_via_relay(
+        relay: String,
+        relay_port: u16,
+        session: String,
+        expected_host_pub: Vec<u8>,
+    ) -> Result<Self> {
+        // Refused before any socket opens, exactly as the token path refuses.
+        // An empty id would be sent to the relay as a join and come back as
+        // "no such session" — a network round trip to report a local mistake.
+        if session.is_empty() {
+            anyhow::bail!("relay session must not be empty");
+        }
+        Self::connect_inner(
+            ClientReach::ViaRelay {
+                relay,
+                relay_port,
+                session,
+            },
             String::new(),
             expected_host_pub,
         )
@@ -913,6 +976,103 @@ unsafe extern "C" fn jni_start_paired_session(
     });
 }
 
+/// `RDRust.startPairedRelaySession(relayIp, relayPort, hostPubkey, session)` —
+/// reconnect with no QR, through the relay this device paired through.
+///
+/// Its own native for the reason `startPairedSession` is: which credential is
+/// presented must be visible in the call, not decided by a blank string.
+///
+/// ## The parameter order is deliberate
+///
+/// The natural order — address, port, session, pin — gives
+/// `(String, Int, String, ByteArray)`, which is EXACTLY the shape and JNI
+/// descriptor of `startSession(hostIp, port, sessionToken, hostPubkey)`. A call
+/// site that passed a stored relay session id where a pairing token belongs, or
+/// the other way round, would compile without a murmur. Putting the pin before
+/// the session makes this `(String, Int, ByteArray, String)`, so the two can
+/// never be confused by the compiler, and a test pins that no two natives share
+/// a descriptor.
+///
+/// ## Never in a status line
+///
+/// The endpoint is `relay <addr>:<port>`, as for the relay pairing path. The
+/// session id is a credential against the relay — a stranger holding one can
+/// occupy the host's join slot — and the status string reaches the log and the
+/// screen.
+///
+/// ## Failures the existing natives stay silent about
+///
+/// They return without touching the status when a Java string cannot be read,
+/// which leaves the Kotlin side reading whatever the LAST session reported. This
+/// one says so. And a port the Kotlin side got wrong is refused rather than
+/// truncated by `as u16` into a different, valid-looking port.
+unsafe extern "C" fn jni_start_paired_relay_session(
+    env: *mut jni::sys::JNIEnv,
+    _c: jclass,
+    relay_ip: jni::sys::jstring,
+    relay_port: jint,
+    host_pubkey: jbyteArray,
+    session: jni::sys::jstring,
+) {
+    let expected_host_pub = extract_bytes(env, host_pubkey);
+
+    let mut env = match jni::JNIEnv::from_raw(env) {
+        Ok(e) => e,
+        Err(_) => {
+            set_session_status("failed", "could not read the reconnect request");
+            return;
+        }
+    };
+    let relay_ip: String = match env.get_string(&jni::objects::JString::from_raw(relay_ip)) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            set_session_status("failed", "could not read the stored relay address");
+            return;
+        }
+    };
+    let session: String = match env.get_string(&jni::objects::JString::from_raw(session)) {
+        Ok(s) => s.into(),
+        Err(_) => {
+            set_session_status("failed", "could not read the stored relay session");
+            return;
+        }
+    };
+    let Some(relay_port) = relay_port_from(relay_port) else {
+        set_session_status("failed", "the stored relay port is not a port");
+        return;
+    };
+
+    if expected_host_pub.len() != 32 {
+        set_session_status("failed", "missing or invalid 32-byte host pin");
+        return;
+    }
+    if session.is_empty() {
+        set_session_status("failed", "no relay session is stored for this host");
+        return;
+    }
+
+    let endpoint = format!("relay {relay_ip}:{relay_port}");
+    set_session_status("connecting", &endpoint);
+
+    std::thread::spawn(move || {
+        match block_on_paired_relay_handshake(relay_ip, relay_port, session, expected_host_pub) {
+            Ok(()) => set_session_status("idle", &format!("session via {endpoint} ended")),
+            Err(e) => set_session_status("failed", &format!("{endpoint}: {e}")),
+        }
+    });
+}
+
+/// A port from the Java side, or `None` if it is not one.
+///
+/// `as u16` would turn 70000 into 4464 and 0 into "any port": a wrong stored
+/// value would be dialled as a different, plausible one.
+fn relay_port_from(port: jint) -> Option<u16> {
+    match u16::try_from(port) {
+        Ok(0) | Err(_) => None,
+        Ok(p) => Some(p),
+    }
+}
+
 // ── Client handshake implementation ──────────────────────────────────
 
 /// Noise pattern used by the live initiator handshake in `noise_transport_handshake`.
@@ -982,13 +1142,23 @@ async fn noise_transport_handshake(
     Ok(hs.into_transport_mode()?)
 }
 
-async fn send_noise_msg(stream: &mut TcpStream, data: &[u8]) -> Result<()> {
+/// Write one length-prefixed message in ONE write.
+///
+/// It used to be two — the four-byte length, then the body — which put every
+/// input event on the wire as two packets, and with Nagle on held the body
+/// until the length was acknowledged. One buffer is one segment for anything
+/// that fits, and half the packets for a lossy link to lose.
+async fn send_noise_msg<W: tokio::io::AsyncWrite + Unpin>(
+    stream: &mut W,
+    data: &[u8],
+) -> Result<()> {
     if data.is_empty() || data.len() > MAX_NOISE_FRAME {
         anyhow::bail!("noise message out of bounds: {}", data.len());
     }
-    let len = (data.len() as u32).to_be_bytes();
-    stream.write_all(&len).await?;
-    stream.write_all(data).await?;
+    let mut framed = Vec::with_capacity(4 + data.len());
+    framed.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    framed.extend_from_slice(data);
+    stream.write_all(&framed).await?;
     Ok(())
 }
 
@@ -1087,6 +1257,28 @@ pub async fn run_paired_session(
     .await
 }
 
+/// [`run_paired_session`] through a relay: a token-less reconnect to a host this
+/// device is already enrolled with, presenting the session id it kept from its
+/// relay pairing. The production session loop, so a test driving this drives
+/// what the phone runs.
+pub async fn run_paired_relay_session(
+    relay: String,
+    relay_port: u16,
+    session: String,
+    expected_host_pub: Vec<u8>,
+) -> Result<()> {
+    run_session(
+        ClientReach::ViaRelay {
+            relay,
+            relay_port,
+            session,
+        },
+        ClientAuth::Paired,
+        expected_host_pub,
+    )
+    .await
+}
+
 async fn run_session(
     reach: ClientReach,
     auth: ClientAuth,
@@ -1128,12 +1320,27 @@ async fn run_session(
                 )
                 .await?
             }
-            // A paired reconnect through a relay needs a session id, and a
-            // paired device has no invite to get one from. Refused rather than
-            // invented: the relay route's reconnection story is the host
-            // re-issuing an invite, not this path guessing an id.
-            (ClientReach::ViaRelay { .. }, ClientAuth::Paired) => {
-                anyhow::bail!("a paired reconnect has no relay session to present")
+            // A paired reconnect through a relay. It used to be refused: the
+            // relay issued a random session id per registration, so the id a
+            // phone paired against died with the host's next restart and there
+            // was nothing to reconnect to. An enrolled host now keeps its id for
+            // as long as the relay runs, and the phone keeps the id it paired
+            // with — never invented here, only presented.
+            (
+                ClientReach::ViaRelay {
+                    relay,
+                    relay_port,
+                    session,
+                },
+                ClientAuth::Paired,
+            ) => {
+                PinnedNoiseSession::connect_paired_via_relay(
+                    relay,
+                    relay_port,
+                    session,
+                    expected_host_pub,
+                )
+                .await?
             }
         };
         // The only point at which the host has proved it holds the pinned key.
@@ -1196,6 +1403,20 @@ fn block_on_relay_handshake(
 
 fn block_on_paired_handshake(host_ip: String, port: u16, expected_host_pub: Vec<u8>) -> Result<()> {
     tokio::runtime::Runtime::new()?.block_on(run_paired_session(host_ip, port, expected_host_pub))
+}
+
+fn block_on_paired_relay_handshake(
+    relay: String,
+    relay_port: u16,
+    session: String,
+    expected_host_pub: Vec<u8>,
+) -> Result<()> {
+    tokio::runtime::Runtime::new()?.block_on(run_paired_relay_session(
+        relay,
+        relay_port,
+        session,
+        expected_host_pub,
+    ))
 }
 
 /// What one decrypted host message turned out to be.
@@ -1747,6 +1968,11 @@ fn native_registrations() -> Vec<ClassBindings> {
                     jni_start_paired_session as *mut c_void,
                 ),
                 b(
+                    "startPairedRelaySession",
+                    "(Ljava/lang/String;I[BLjava/lang/String;)V",
+                    jni_start_paired_relay_session as *mut c_void,
+                ),
+                b(
                     "registerFrameReceiver",
                     "()V",
                     jni_register_frame_receiver as *mut c_void,
@@ -1851,6 +2077,65 @@ unsafe fn jni_on_load_inner(vm: *mut jni::sys::JavaVM) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    // ── small messages leave at once ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_session_socket_sends_small_messages_without_nagle_delay() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let reach = ClientReach::Direct {
+            host: "127.0.0.1".to_string(),
+            port,
+        };
+        let (opened, _accepted) = tokio::join!(reach.open(), listener.accept());
+        assert!(
+            opened.unwrap().nodelay().unwrap(),
+            "Nagle holds each input event until the last one is acknowledged"
+        );
+    }
+
+    /// Counts `poll_write` calls, accepting everything it is given.
+    struct CountingWriter {
+        writes: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl tokio::io::AsyncWrite for CountingWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_noise_message_leaves_in_one_write() {
+        let mut w = CountingWriter {
+            writes: 0,
+            bytes: Vec::new(),
+        };
+        send_noise_msg(&mut w, b"pointer-move").await.unwrap();
+        assert_eq!(w.writes, 1, "length and body must go out together");
+        let mut expected = 12u32.to_be_bytes().to_vec();
+        expected.extend_from_slice(b"pointer-move");
+        assert_eq!(w.bytes, expected);
+    }
 
     /// The invite path must keep refusing a token-less connection.
     ///
@@ -1863,6 +2148,189 @@ mod tests {
     /// Note it refuses before any socket is opened: the address below is never
     /// connected to, so a failure here cannot be a network error wearing the
     /// right message.
+    /// A paired relay reconnect with no stored session is a local mistake, and
+    /// is reported as one — before a socket opens. Sent to the relay it would
+    /// come back as "no such session", which reads as a host that is not
+    /// running and sends the operator to the wrong machine.
+    #[test]
+    fn a_paired_relay_reconnect_refuses_an_empty_session_without_touching_the_network() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let outcome = runtime.block_on(super::PinnedNoiseSession::connect_paired_via_relay(
+            // Reserved for documentation (RFC 5737); nothing answers here.
+            "192.0.2.1".to_string(),
+            9,
+            String::new(),
+            vec![0u8; 32],
+        ));
+        match outcome {
+            Ok(_) => panic!("an empty relay session must be refused"),
+            Err(e) => assert!(
+                e.to_string().contains("relay session must not be empty"),
+                "refusal must name the missing session, got: {e}"
+            ),
+        }
+    }
+
+    /// **No two session-starting natives share a JNI descriptor.**
+    ///
+    /// The paired relay reconnect takes an address, a port, a session id and a
+    /// pin. In that natural order its shape is identical to `startSession`,
+    /// which takes an address, a port, a PAIRING TOKEN and a pin — so a Kotlin
+    /// call site that handed a stored session id to the token parameter, or the
+    /// reverse, would compile and run. Ordering the pin before the session makes
+    /// the mistake a type error; this keeps it one if a native is added later.
+    ///
+    /// Only the natives that start a session are compared. Several others are
+    /// `()V` and are meant to be: they take nothing that could be swapped.
+    /// **The phone recognises a relay refusal by this client's words.**
+    ///
+    /// `NativeFailure.RELAY_REFUSED_MARK` in the app is matched against the
+    /// status detail this crate writes. If either side changed its text, every
+    /// relay refusal would silently go back to being reported as "screen stream
+    /// stopped" — nothing would fail, and the operator would be sent to the
+    /// wrong machine. So a REAL refusal is produced here, over loopback, and
+    /// checked against the constant as the app source declares it.
+    /// **A stored relay session id never reaches a string.**
+    ///
+    /// The id is a credential against the relay: whoever holds one can occupy
+    /// the host's join slot. The app now KEEPS it, so the code that handles it
+    /// is no longer one pairing function — it is the stored route, the record,
+    /// the registry that logs what it remembers, and the orchestrator that
+    /// labels a connection. Any string template in them that mentions a session
+    /// is a log line, a label or a toast waiting to carry it.
+    ///
+    /// Passing it as an ARGUMENT — to the native, or to the storage encoder —
+    /// is what it is for, and is not a template.
+    #[test]
+    fn no_stored_relay_session_is_interpolated_into_a_string() {
+        let dir = kotlin_dir();
+        let mut scanned = 0;
+        for file in [
+            "RelayRoute.kt",
+            "PairedHostRecord.kt",
+            "PairedHostRegistry.kt",
+            "SessionOrchestrator.kt",
+        ] {
+            let source = std::fs::read_to_string(dir.join(file))
+                .unwrap_or_else(|e| panic!("cannot read {file}: {e}"));
+            for (n, line) in source.lines().enumerate() {
+                let code = line.trim_start();
+                // Comments explain the rule; they are not the risk.
+                if code.starts_with("//") || code.starts_with('*') || code.starts_with("/*") {
+                    continue;
+                }
+                let templated = code.contains("$session")
+                    || code.split("${").skip(1).any(|expr| {
+                        expr.split('}')
+                            .next()
+                            .is_some_and(|e| e.contains("session"))
+                    });
+                assert!(
+                    !templated,
+                    "{file}:{} interpolates a relay session id into a string: {code}",
+                    n + 1
+                );
+            }
+            scanned += 1;
+        }
+        assert_eq!(scanned, 4);
+    }
+
+    #[test]
+    fn a_relay_refusal_carries_the_words_the_app_looks_for() {
+        let source = std::fs::read_to_string(kotlin_dir().join("SessionState.kt"))
+            .expect("the app's SessionState.kt");
+        let decl = source
+            .lines()
+            .find(|l| l.contains("const val RELAY_REFUSED_MARK"))
+            .expect("the app no longer declares RELAY_REFUSED_MARK");
+        let mark = decl
+            .split('"')
+            .nth(1)
+            .expect("RELAY_REFUSED_MARK is not a string literal");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let why = runtime.block_on(async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let relay = tokio::spawn(async move {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut len = [0u8; 4];
+                s.read_exact(&mut len).await.unwrap();
+                let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
+                s.read_exact(&mut body).await.unwrap();
+                let reply = relay_proto::encode(&relay_proto::ControlFrame::Denied {
+                    why: "no such session".to_string(),
+                });
+                s.write_all(&(reply.len() as u32).to_be_bytes())
+                    .await
+                    .unwrap();
+                s.write_all(&reply).await.unwrap();
+            });
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let outcome = super::relay_join(&mut stream, "AAAAAAAAAAAAAAAAAAAAAA").await;
+            relay.await.unwrap();
+            outcome
+                .expect_err("a Denied frame was accepted")
+                .to_string()
+        });
+        assert!(
+            why.contains(mark),
+            "the client reports a relay refusal as `{why}`, which does not contain the app's \
+             RELAY_REFUSED_MARK `{mark}` — the app would call it a stream failure"
+        );
+    }
+
+    #[test]
+    fn every_session_starting_native_has_its_own_descriptor() {
+        let starts: Vec<(&str, &str)> = native_registrations()
+            .into_iter()
+            .flat_map(|class| class.methods)
+            .filter(|m| m.method.starts_with("start"))
+            .map(|m| (m.method, m.signature))
+            .collect();
+        assert!(
+            starts.iter().any(|(n, _)| *n == "startPairedRelaySession"),
+            "the paired relay native is not registered at all"
+        );
+        assert!(
+            starts.len() >= 4,
+            "expected at least four session natives: {starts:?}"
+        );
+        for (i, (name, sig)) in starts.iter().enumerate() {
+            for (other, other_sig) in &starts[i + 1..] {
+                assert_ne!(
+                    sig, other_sig,
+                    "{name} and {other} have the same descriptor {sig}: a caller can pass one's \
+                     credential to the other and the compiler will not notice"
+                );
+            }
+        }
+    }
+
+    /// A stored port the Kotlin side got wrong is refused, not truncated. `as
+    /// u16` would dial 70000 as 4464 and treat 0 as "any port".
+    #[test]
+    fn a_stored_relay_port_that_is_not_a_port_is_refused() {
+        for bad in [0, -1, 65_536, 70_000, i32::MIN, i32::MAX] {
+            assert_eq!(
+                super::relay_port_from(bad),
+                None,
+                "{bad} was accepted as a relay port"
+            );
+        }
+        assert_eq!(super::relay_port_from(9443), Some(9443));
+        assert_eq!(super::relay_port_from(1), Some(1));
+        assert_eq!(super::relay_port_from(65_535), Some(65_535));
+    }
+
     #[test]
     fn connect_refuses_an_empty_token_without_touching_the_network() {
         let runtime = tokio::runtime::Builder::new_current_thread()

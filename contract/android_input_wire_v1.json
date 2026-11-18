@@ -9,7 +9,8 @@
     "Neither side imports the other. The file is the contract; drift on either",
     "side turns that side's suite red instead of failing silently on a device.",
     "Block 11 added TextInput. The phone sends TEXT, not scan codes: a scan code names a physical key position and only the host knows which position produces which character, so the mapping lives in module10::keymap and the wire carries what the user actually typed.",
-    "2026-08-30: added the three scroll cases. MouseScroll is NOT a new wire message - the host has accepted and injected it since Block 7, coarse detents and hi-res, both axes. What was missing was any client that sent one: two fingers went to onZoomPan, marked 'no host traffic', so a swipe moved the rendered picture and never left the phone. This is a builder joining a message that was already contracted on the Rust side. Lines rather than Pixels because a two-finger swipe has already been quantised into detents by the time it reaches the wire, and sending pixels would mean inventing a hi-res figure this path does not have."
+    "2026-08-30: added the three scroll cases. MouseScroll is NOT a new wire message - the host has accepted and injected it since Block 7, coarse detents and hi-res, both axes. What was missing was any client that sent one: two fingers went to onZoomPan, marked 'no host traffic', so a swipe moved the rendered picture and never left the phone. This is a builder joining a message that was already contracted on the Rust side. Lines rather than Pixels because a two-finger swipe has already been quantised into detents by the time it reaches the wire, and sending pixels would mean inventing a hi-res figure this path does not have.",
+    "2026-11-17 (RD-TEXT-1): a text command now carries a numeric text_id beside window and event. The host echoes it, with how many characters were typed, in whatever reply it gives that run, so a refused or interrupted paragraph goes back into the phone's compose field instead of being lost. A host that predates it ignores the field (the gate reads only window and event); a phone that predates it sends none and gets the old replies byte for byte. limits pins what both ends enforce: max_text_chars (characters, Enter included) and input_v1_max_payload, the 4 KiB envelope the shipping client frames EVERY input_event in (wire::Kind::InputV1). The native session loop drops a command that will not fit that envelope AFTER sendCommand has returned true, so the phone must refuse an over-size run itself, by measured encoded size, before its compose field clears. text_content_refusals are the host reasons that refuse a run for its CONTENT; the host keeps the grant for those, so the phone must not switch to Viewing Only on them."
   ],
   "valid": [
     {
@@ -206,11 +207,13 @@
       "builder": "text",
       "window": 42,
       "args": [
-        "hello"
+        "hello",
+        1
       ],
       "command": {
         "type": "input_event",
         "window": 42,
+        "text_id": 1,
         "event": {
           "TextInput": {
             "text": "hello"
@@ -223,11 +226,13 @@
       "builder": "text",
       "window": 42,
       "args": [
-        "say \"hi\" \\ now"
+        "say \"hi\" \\ now",
+        2
       ],
       "command": {
         "type": "input_event",
         "window": 42,
+        "text_id": 2,
         "event": {
           "TextInput": {
             "text": "say \"hi\" \\ now"
@@ -240,11 +245,13 @@
       "builder": "text",
       "window": 42,
       "args": [
-        "a\n\tb"
+        "a\n\tb",
+        3
       ],
       "command": {
         "type": "input_event",
         "window": 42,
+        "text_id": 3,
         "event": {
           "TextInput": {
             "text": "a\n\tb"
@@ -257,11 +264,13 @@
       "builder": "text",
       "window": 42,
       "args": [
-        ""
+        "",
+        4
       ],
       "command": {
         "type": "input_event",
         "window": 42,
+        "text_id": 4,
         "event": {
           "TextInput": {
             "text": ""
@@ -463,5 +472,13 @@
       },
       "why": "KeyAction serialises as `Down`/`Up`. Lower case is the drift a hand-written client produces, and accepting it would mean the two sides no longer agree on one spelling."
     }
-  ]
+  ],
+  "limits": {
+    "max_text_chars": 2000,
+    "input_v1_max_payload": 4096,
+    "text_content_refusals": [
+      "text_too_long",
+      "unsupported_character"
+    ]
+  }
 }

@@ -75,7 +75,7 @@ class MainActivity : AppCompatActivity() {
             when (val move = pointerRouter.onMove(pointerMode, viewX, viewY)) {
                 is PointerMove.Absolute -> {
                     val p = mapTouch(move.viewX, move.viewY) ?: return
-                    InputController.onAbsoluteMove(p.x, p.y)
+                    InputController.onAbsoluteMove(p)
                 }
                 // Relative deltas are in VIEW pixels and are sent as-is. They
                 // are deliberately NOT scaled by the current zoom: a trackpad's
@@ -91,12 +91,12 @@ class MainActivity : AppCompatActivity() {
 
         override fun onTap(viewX: Float, viewY: Float) {
             val p = mapTouch(viewX, viewY) ?: return
-            InputController.onTapAt(p.x, p.y)
+            InputController.onTapAt(p)
         }
 
         override fun onLongPress(viewX: Float, viewY: Float) {
             val p = mapTouch(viewX, viewY) ?: return
-            InputController.onLongPressAt(p.x, p.y)
+            InputController.onLongPressAt(p)
         }
 
         override fun onGestureEnd(eventTimeMs: Long) {
@@ -177,7 +177,7 @@ class MainActivity : AppCompatActivity() {
 
         override fun onTwoFingerTap(viewX: Float, viewY: Float) {
             val p = mapTouch(viewX, viewY) ?: return
-            InputController.onSecondaryTapAt(p.x, p.y)
+            InputController.onSecondaryTapAt(p)
         }
 
         override fun onTwoFingerGestureEnd() {
@@ -191,7 +191,7 @@ class MainActivity : AppCompatActivity() {
     private val touchRouter by lazy { SurfaceTouchRouter(this, gestures) }
 
     /**
-     * Fingertip -> host desktop pixel, lifted by the slider.
+     * Fingertip -> negotiated surface position, lifted by the slider.
      *
      * Fails closed. If no frame has been drawn yet, or the surface was
      * destroyed, or the geometry is degenerate, this returns null and the
@@ -199,10 +199,17 @@ class MainActivity : AppCompatActivity() {
      * when it does not know where the frame is will click *something*, and
      * clicking nothing is the correct behaviour.
      */
-    private fun mapTouch(viewX: Float, viewY: Float): DesktopCoordinateMapper.DesktopPoint? {
+    private fun mapTouch(viewX: Float, viewY: Float): PointerPosition? {
+        val space = SessionOrchestrator.currentPointerCoordinateSpace() ?: return null
         val geometry = pipeline?.currentGeometry() ?: return null
         val offsetPx = DesktopCoordinateMapper.dpToPx(cursorLiftDp, resources.displayMetrics.density)
-        return DesktopCoordinateMapper.mapTouchToDesktop(geometry, viewX, viewY, offsetPx)
+        val point = when (space) {
+            PointerCoordinateSpace.DESKTOP_PIXELS ->
+                DesktopCoordinateMapper.mapTouchToDesktop(geometry, viewX, viewY, offsetPx)
+            PointerCoordinateSpace.NORMALIZED_V1 ->
+                DesktopCoordinateMapper.mapTouchToNormalized(geometry, viewX, viewY, offsetPx)
+        } ?: return null
+        return PointerPosition(point.x, point.y, space)
     }
 
     /**
@@ -235,7 +242,25 @@ class MainActivity : AppCompatActivity() {
         private const val PREFS = "remotedexter.ui"
         private const val KEY_CURSOR_LIFT = "cursor_lift_dp"
 
+        /**
+         * Lines the compose field grows to before it scrolls. Enough to read a
+         * few sentences back; few enough that the desktop stays visible above.
+         */
+        const val COMPOSE_MAX_LINES = 4
     }
+
+    /** The operator-facing sentence for text the host handed back. */
+    private fun describeReturn(reason: String, returned: PendingTexts.Returned, max: Int?): String =
+        when (val k = TextReturn.kind(reason, returned, max)) {
+            is TextReturn.Kind.Untypable -> getString(R.string.text_returned_untypable, k.label)
+            is TextReturn.Kind.TooLong ->
+                if (k.max != null) getString(R.string.text_returned_too_long, k.max)
+                else getString(R.string.text_returned_too_long_unknown)
+            is TextReturn.Kind.StoppedPartway ->
+                getString(R.string.text_returned_partway, k.typed, k.composed, k.reason)
+            is TextReturn.Kind.EnterNotPressed -> getString(R.string.text_returned_before_enter, k.reason)
+            is TextReturn.Kind.NotTyped -> getString(R.string.text_returned_not_typed, k.reason)
+        }
 
     /**
      * Owns the render pipeline for the lifetime of the surface.
@@ -296,6 +321,16 @@ class MainActivity : AppCompatActivity() {
         supportActionBar?.hide()
 
         applyOrientation(resources.configuration.orientation)
+        // Upright, the panel is re-fitted to its rows after every layout, so a
+        // row that grows can never push the scroll pair out. See fitPortraitPanel.
+        val panelInner = findViewById<View>(R.id.controlsPanelInner)
+        panelInner.viewTreeObserver.addOnGlobalLayoutListener {
+            if (resources.configuration.orientation !=
+                android.content.res.Configuration.ORIENTATION_LANDSCAPE
+            ) {
+                fitPortraitPanel(panelInner)
+            }
+        }
 
         desktopSurface = findViewById(R.id.desktopSurface)
         desktopSurface.holder.addCallback(surfaceCallback)
@@ -547,6 +582,41 @@ class MainActivity : AppCompatActivity() {
         for ((v, lp) in params) v.layoutParams = lp
     }
 
+    /**
+     * Give the upright panel exactly the height its rows need, measured.
+     *
+     * The panel is the last thing on the screen and the scroll pair is its last
+     * row, so whatever the rows need beyond the panel's height comes out of the
+     * scroll pair — and with two fingers always panning (f42210e), those two
+     * buttons are the operator's ONLY way to scroll.
+     *
+     * The height was pinned by arithmetic, `controls_panel_height`, because
+     * `wrap_content` let the parent squeeze the panel (see dimens.xml). The
+     * arithmetic was short: it never counted the chord row's padding, so the
+     * rows needed 557px of the 550 given on a 440dpi screen — measured
+     * 2026-09-18 after the operator reported the scroll pair missing. Measuring
+     * keeps the height explicit, so the old squeeze cannot come back, and makes
+     * it follow the content, so a row that grows — a label, a larger font, a
+     * state line — grows the panel instead of pushing the pair off the screen.
+     *
+     * Called after every layout. It only writes when the need changed, so it
+     * settles in one extra pass.
+     */
+    private fun fitPortraitPanel(inner: View) {
+        val width = inner.width
+        if (width <= 0) return
+        inner.measure(
+            View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+        )
+        val needed = inner.measuredHeight
+        val lp = inner.layoutParams
+        if (needed > 0 && lp.height != needed) {
+            lp.height = needed
+            inner.layoutParams = lp
+        }
+    }
+
     /** Where a movable button lives in portrait, so it can be put back. */
     private data class PanelHome(val parent: android.widget.LinearLayout, val index: Int)
 
@@ -689,28 +759,59 @@ class MainActivity : AppCompatActivity() {
         //
         //   Type  -> the text lands in whatever has focus, and stops there.
         //   Enter -> the text lands AND is submitted.
+        // A paragraph has to be READABLE before it is sent — that is the whole
+        // point of composing (RD-TEXT-1). The field stays a single-line INPUT,
+        // so the keyboard's action key is still Go rather than a newline, but
+        // it wraps onto a few lines instead of scrolling sideways out of sight.
+        // Set here, not in the layout: a single-line input type forces one
+        // horizontally scrolling line while the view is inflated, and these
+        // two calls are what undo that after it.
+        sink.setHorizontallyScrolling(false)
+        sink.maxLines = COMPOSE_MAX_LINES
+
         fun send(submit: Boolean) {
             val buffer = sink.text?.toString() ?: ""
-            val action =
+            val sent =
                 if (submit) InputController.commitText(buffer)
                 else InputController.stageText(buffer)
-            when (action) {
-                is KeyboardInput.Action.Drop -> {
-                    // Only worth a toast when the user cannot fix it by typing.
+            // Cleared only when the run was actually queued. Clearing on a
+            // refusal — no control, too long, a session that would not take
+            // it — would throw away what the user typed and leave them nothing
+            // to retry with.
+            if (sent.clearsField) {
+                sink.setText("")
+                return
+            }
+            val message = when (sent) {
+                TextSend.NotQueued -> getString(R.string.keyboard_not_queued)
+                is TextSend.Refused -> when (val a = sent.action) {
+                    is KeyboardInput.Action.TooLong ->
+                        getString(R.string.keyboard_too_long, a.length, a.max)
+                    is KeyboardInput.Action.TooLargeToSend ->
+                        getString(R.string.keyboard_too_large, a.bytes, a.max)
                     // "nothing typed" is a button pressed on an empty field and
                     // needs no announcement.
-                    if (action.why != "nothing typed") {
-                        Toast.makeText(
-                            this,
-                            getString(R.string.keyboard_needs_control),
-                            Toast.LENGTH_SHORT
-                        ).show()
-                    }
+                    is KeyboardInput.Action.Drop ->
+                        if (a.why == "nothing typed") null
+                        else getString(R.string.keyboard_needs_control)
+                    else -> null
                 }
-                // Cleared only on a send that actually happened. Clearing on a
-                // refusal would throw away what the user typed and leave them
-                // nothing to retry after granting control.
-                else -> sink.setText("")
+                TextSend.Queued -> null
+            }
+            message?.let { Toast.makeText(this, it, Toast.LENGTH_LONG).show() }
+        }
+
+        // The host refused or stopped a run this phone sent. Whatever did not
+        // reach the desktop goes back into the field — IN FRONT of anything
+        // typed since, because it came first — and the operator is told why.
+        InputController.onTextReturned = { reason, returned, max ->
+            runOnUiThread {
+                if (returned.untyped.isNotEmpty()) {
+                    val since = sink.text?.toString() ?: ""
+                    sink.setText(returned.untyped + since)
+                    sink.setSelection(sink.text?.length ?: 0)
+                }
+                Toast.makeText(this, describeReturn(reason, returned, max), Toast.LENGTH_LONG).show()
             }
         }
 
@@ -992,7 +1093,7 @@ class MainActivity : AppCompatActivity() {
             // remembered host is what makes a greyed Connect self-explanatory
             // instead of looking like a broken control.
             is SessionState.Idle -> when (
-                val line = IdleStatus.describe(PairedHostRegistry(this).active()?.host?.addr)
+                val line = IdleStatus.describe(PairedHostRegistry(this).active()?.idleLabel())
             ) {
                 is IdleStatus.Line.NeedsPairing -> getString(R.string.state_idle_unpaired)
                 is IdleStatus.Line.Paired ->

@@ -232,9 +232,12 @@ object SessionStarter {
      * against a different schema. A route that reached the transport with fewer
      * gates would make "scan the relay code instead" a way to bypass them.
      *
-     * What it deliberately does NOT do is store a paired-host record. A relay
-     * session has no address to reconnect to and its session id is single-use,
-     * so a stored row for this route would be one that can never work.
+     * It does not store a paired-host record itself, and neither path does: the
+     * record is written by `SessionOrchestrator` only once the host reports
+     * `connected`, which it does only after accepting this device. The relay
+     * route IS recorded now — the relay gives an enrolled host the same session
+     * id across the host's restarts, so the route stays usable (see
+     * [com.remotedexter.RelayRoute]).
      */
     fun startFromRelayInvite(invite: InviteV5, context: Context?) {
         RdxLog.i(

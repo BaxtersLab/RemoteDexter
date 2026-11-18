@@ -36,8 +36,11 @@
 
 use std::collections::BTreeMap;
 
-/// Root-owned, fixed. The console never builds this path from anything.
-pub const HELPER: &str = "/usr/libexec/remotedexter/remotedexter-enable-input";
+/// Root-owned, fixed. The console never builds this path from anything. It is
+/// where `scripts/build-deb.sh` installs the helper (A1: all payload under
+/// /opt/baxters/remotedexter), and `the_host_runs_the_helper_from_where_the_
+/// package_installs_it` fails if the two ever disagree.
+pub const HELPER: &str = "/opt/baxters/remotedexter/remotedexter-enable-input";
 
 /// Ordinary administrator authentication. There is no RemoteDexter polkit
 /// policy: with none installed, `pkexec` falls back to
@@ -605,6 +608,86 @@ mod tests {
                 "{name} must be a single-quoted literal with no expansion, got {line:?}"
             );
         }
+    }
+
+    // ── the layout the package installs, and the constants that assume it ──
+
+    fn build_deb() -> String {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/build-deb.sh");
+        std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()))
+    }
+
+    /// The single-quoted value of a constant the helper defines, e.g. `SRC`.
+    fn helper_constant(name: &str) -> String {
+        let prefix = format!("{name}=");
+        let code = helper_code();
+        let line = code
+            .lines()
+            .map(str::trim_start)
+            .find(|l| l.starts_with(&prefix))
+            .unwrap_or_else(|| panic!("helper must define {prefix}"));
+        line[prefix.len()..].trim().trim_matches('\'').to_string()
+    }
+
+    /// Whether build-deb.sh installs something at exactly `path` on the target.
+    /// Its destinations are written out in full so that this can be asked.
+    fn package_installs(path: &str) -> bool {
+        build_deb().contains(&format!("\"$PKGDIR{path}\""))
+    }
+
+    /// A guard that could only ever pass proves nothing about the layout.
+    #[test]
+    fn the_install_matcher_tells_installed_from_not_installed() {
+        assert!(
+            package_installs("/opt/baxters/remotedexter/run.sh"),
+            "control: the launcher is installed there"
+        );
+        assert!(
+            !package_installs("/opt/baxters/remotedexter/nothing-is-here"),
+            "control: a path the package does not install must not match"
+        );
+    }
+
+    /// The host runs the helper through pkexec at HELPER. If the package ever
+    /// put it anywhere else, "Enable input" would fail at the one moment the
+    /// operator asks for it -- possibly from the phone, at a machine nobody is
+    /// sitting at -- while every other test stayed green.
+    #[test]
+    fn the_host_runs_the_helper_from_where_the_package_installs_it() {
+        assert!(
+            package_installs(HELPER),
+            "scripts/build-deb.sh does not install the helper at {HELPER}, the path the host runs"
+        );
+    }
+
+    /// The helper copies the rule from SRC, a literal nobody can override. If
+    /// the package shipped the rule anywhere else, enable would fail with
+    /// missing_packaged_rule.
+    #[test]
+    fn the_helper_reads_the_rule_from_where_the_package_installs_it() {
+        let src = helper_constant("SRC");
+        assert!(
+            package_installs(&src),
+            "scripts/build-deb.sh does not install the rule at {src}, the path the helper reads"
+        );
+    }
+
+    /// The installed launcher execs BIN. A package that put host_app anywhere
+    /// else would ship an icon that opens nothing.
+    #[test]
+    fn the_launcher_execs_the_host_where_the_package_installs_it() {
+        let launcher = packaged("remotedexter-launcher");
+        let bin = launcher
+            .lines()
+            .find_map(|l| l.strip_prefix("BIN="))
+            .expect("the launcher must define BIN=")
+            .trim()
+            .trim_matches('"')
+            .to_string();
+        assert!(
+            package_installs(&bin),
+            "scripts/build-deb.sh does not install host_app at {bin}, the path the launcher execs"
+        );
     }
 
     /// Arguments are checked before privilege, before the filesystem, before

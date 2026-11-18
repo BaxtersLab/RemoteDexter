@@ -48,7 +48,7 @@ object PendingConnects {
      * Action for a deliberate reconnect to the already-paired host.
      *
      * Carries no extras at all — not even an id. There is no invite and no
-     * token to park: the destination comes from [PairedHostStore] and the
+     * token to park: the destination comes from [PairedHostRegistry] and the
      * credential is the device's own Noise key, which never leaves native code.
      * A replayed copy of this intent can therefore do nothing an unreplayed one
      * could not, which is why it needs none of [ACTION_CONNECT]'s one-shot

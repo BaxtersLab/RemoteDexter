@@ -83,6 +83,40 @@ fn shapes_the_client_must_never_send_are_rejected() {
     eprintln!("verified {} shapes are rejected", cases.len());
 }
 
+/// RD-TEXT-1: the phone refuses an over-long paragraph locally, by the same
+/// number the host enforces. The fixture is where both ends read it; this pins
+/// the host's side, `InputJsonContractTest` the phone's.
+#[test]
+fn the_text_ceiling_is_the_one_the_phone_enforces() {
+    let f = fixture();
+    assert_eq!(
+        f["limits"]["max_text_chars"].as_u64(),
+        Some(module10::keymap::MAX_TEXT_CHARS as u64),
+        "the phone would let through what the host refuses, or refuse what it accepts"
+    );
+}
+
+/// Every text command carries the numeric id the host echoes back, so the
+/// phone can tell which paragraph a refusal belongs to.
+#[test]
+fn every_text_command_carries_a_numeric_text_id() {
+    let f = fixture();
+    let texts: Vec<&Value> = f["valid"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["builder"] == "text")
+        .collect();
+    assert!(!texts.is_empty(), "no text cases — a vacuous pass");
+    for case in texts {
+        let name = case["name"].as_str().unwrap();
+        assert!(
+            case["command"]["text_id"].as_u64().is_some(),
+            "{name}: a text command without a numeric text_id cannot be matched to its reply"
+        );
+    }
+}
+
 /// The desktop surface id is `i64::MAX`, and it has already caused one real
 /// defect: Android's `optLong` is signed, so a `u64::MAX` sentinel round-tripped
 /// to -1 and streaming never started. The fixture carries the real value.

@@ -2,8 +2,10 @@ package com.remotedexter
 
 import com.remotedexter.KeyboardInput.Action
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -250,5 +252,125 @@ class KeyboardInputTest {
     fun newlineAndTabAreCarriedAsText() {
         assertEquals(Action.SendText("\n"), KeyboardInput.onTextTyped(true, 0L, "\n"))
         assertEquals("\t", KeyboardInput.appendedText("a", "a\t"))
+    }
+
+    // ── RD-TEXT-1: a paragraph, bounded by the host's own ceiling ─────────────
+
+    /**
+     * The host refuses more than 2,000 characters. Sending such a run anyway
+     * cleared the field and lost the text to a refusal the phone could have
+     * predicted, so it must not leave the phone.
+     */
+    @Test
+    fun aRunOverTheCeilingIsNotSent() {
+        val staged = KeyboardInput.onStage(true, 0L, "a".repeat(2001))
+        assertFalse("2,001 characters were sent", staged is Action.SendText)
+        assertEquals(Action.TooLong(2001, 2000), staged)
+        // The ceiling itself is accepted, so the bound is the stated one.
+        assertEquals(Action.SendText("a".repeat(2000)), KeyboardInput.onStage(true, 0L, "a".repeat(2000)))
+    }
+
+    /** Go's Enter is a character the host types, so it counts. */
+    @Test
+    fun goCountsItsEnterAgainstTheCeiling() {
+        val submitted = KeyboardInput.onCommit(true, 0L, "a".repeat(2000))
+        assertFalse("2,000 characters plus Enter were sent", submitted is Action.SendText)
+        assertEquals(Action.TooLong(2001, 2000), submitted)
+        assertEquals(
+            Action.SendText("a".repeat(1999) + "\n"),
+            KeyboardInput.onCommit(true, 0L, "a".repeat(1999))
+        )
+    }
+
+    /**
+     * Counted as the host counts: code points. An emoji is two UTF-16 units
+     * and one character; counting units would refuse 1,001 emoji the host
+     * would have measured as 1,001.
+     */
+    @Test
+    fun theCeilingCountsCharactersNotUtf16Units() {
+        val emoji = "😀"
+        assertEquals(1, KeyboardInput.characterCount(emoji))
+        // 2,000 emoji are 2,000 characters — not over the CHARACTER limit,
+        // whatever else is wrong with them (see the byte tests below)...
+        assertFalse(KeyboardInput.onStage(true, 0L, emoji.repeat(2000)) is Action.TooLong)
+        // ...and 2,001 are over it, counted as characters, not 4,002 units.
+        assertEquals(Action.TooLong(2001, 2000), KeyboardInput.onStage(true, 0L, emoji.repeat(2001)))
+    }
+
+    // ── The input envelope: what one command can carry ──────────────────────
+
+    /** The desktop surface's id, the longest a window id gets. */
+    private val desktop = Long.MAX_VALUE
+
+    /** Ordinary prose at the character ceiling fits with plenty of room. */
+    @Test
+    fun proseAtTheCharacterCeilingFitsTheInputEnvelope() {
+        val prose = "Plain sentences, with commas; and a full stop. ".repeat(50).take(2000)
+        assertEquals(Action.SendText(prose), KeyboardInput.onStage(true, desktop, prose))
+        assertTrue(KeyboardInput.encodedCommandBytes(desktop, prose) < 3000)
+    }
+
+    /**
+     * Under 2,000 characters and still too big: quotes escape to two bytes.
+     * Sending it anyway is the case the native loop drops after saying yes.
+     */
+    @Test
+    fun textUnderTheCharacterCeilingCanStillBeTooLargeToSend() {
+        val quoted = "\"".repeat(2000)
+        val action = KeyboardInput.onStage(true, desktop, quoted)
+        assertTrue("$action", action is Action.TooLargeToSend)
+        assertTrue((action as Action.TooLargeToSend).bytes > 4096)
+        assertEquals(4096, action.max)
+    }
+
+    /** Emoji are one character each but four bytes. */
+    @Test
+    fun emojiCountOnceForTheCeilingButFourTimesForTheEnvelope() {
+        val action = KeyboardInput.onStage(true, desktop, "😀".repeat(1100))
+        assertTrue("$action", action is Action.TooLargeToSend)
+    }
+
+    /** The byte bound is exactly the envelope: 4,096 goes, 4,097 does not. */
+    @Test
+    fun theByteCeilingIsExact() {
+        val base = KeyboardInput.encodedCommandBytes(desktop, "")
+        val need = KeyboardInput.MAX_INPUT_COMMAND_BYTES - base
+        val atMax = "\"".repeat(need / 2) + "a".repeat(need % 2)
+        assertTrue(KeyboardInput.characterCount(atMax) <= KeyboardInput.MAX_TEXT_CHARS)
+        assertEquals(4096, KeyboardInput.encodedCommandBytes(desktop, atMax))
+        assertEquals(Action.SendText(atMax), KeyboardInput.onStage(true, desktop, atMax))
+        assertEquals(
+            Action.TooLargeToSend(4097, 4096),
+            KeyboardInput.onStage(true, desktop, atMax + "a")
+        )
+    }
+
+    /** Go's Enter is in the command too, and is measured with it. */
+    @Test
+    fun goIsMeasuredWithItsEnter() {
+        val base = KeyboardInput.encodedCommandBytes(desktop, "")
+        val need = KeyboardInput.MAX_INPUT_COMMAND_BYTES - base
+        val fitsOnlyWithoutEnter = "\"".repeat(need / 2) + "a".repeat(need % 2)
+        assertTrue(KeyboardInput.onStage(true, desktop, fitsOnlyWithoutEnter) is Action.SendText)
+        assertTrue(KeyboardInput.onCommit(true, desktop, fitsOnlyWithoutEnter) is Action.TooLargeToSend)
+    }
+
+    /** The control gate still comes first: no control, no length verdict. */
+    @Test
+    fun anOverLongRunWithoutControlIsRefusedForControl() {
+        assertEquals(
+            Action.Drop("control not granted"),
+            KeyboardInput.onStage(false, 0L, "a".repeat(5000))
+        )
+    }
+
+    /** A real paragraph — past the old 256 — goes through untouched. */
+    @Test
+    fun aParagraphIsSentWhole() {
+        val para = "Several sentences, well past the old limit. ".repeat(20).trim()
+        assertTrue(para.length > 256)
+        assertEquals(Action.SendText(para), KeyboardInput.onStage(true, 0L, para))
+        assertEquals(Action.SendText(para + "\n"), KeyboardInput.onCommit(true, 0L, para))
     }
 }

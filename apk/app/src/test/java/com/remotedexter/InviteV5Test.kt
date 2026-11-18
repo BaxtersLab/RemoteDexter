@@ -139,10 +139,11 @@ class InviteV5Test {
 
     @Test
     fun an_unknown_version_is_still_refused_by_number() {
-        val text = json(invite()).replace("\"version\":5", "\"version\":6")
+        // 7, not 6: v6 is the both-routes invite now.
+        val text = json(invite()).replace("\"version\":5", "\"version\":7")
         val d = InviteDecoder.decode(text)
         assertTrue("expected UnsupportedVersion, got " + d, d is Decoded.UnsupportedVersion)
-        assertEquals(6, (d as Decoded.UnsupportedVersion).found)
+        assertEquals(7, (d as Decoded.UnsupportedVersion).found)
     }
 
     /**

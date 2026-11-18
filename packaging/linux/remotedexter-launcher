@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# The installed launcher: /usr/bin/remotedexter.
+# The installed launcher: /opt/baxters/remotedexter/run.sh, the package's only
+# entry point (Baxters packaging contract A1 s3). The desktop entry execs it, and
+# /usr/bin/remotedexter is a symlink to it so `RD_CAP_INPUT=1 remotedexter`
+# works from a terminal.
 #
 # Two jobs, and nothing else. It scrubs the Snap environment, then execs the
 # host. It starts no service, opens no socket, creates no key and grants no
@@ -20,9 +23,13 @@
 #   * PATH is left alone -- it needs no blanket removal.
 #   * XDG_DATA_DIRS is FILTERED, not dropped: it holds real system paths, and
 #     dropping it takes the desktop's own data directories with it.
-set -uo pipefail
+set -euo pipefail
 
-BIN=/usr/libexec/remotedexter/host_app
+# A fixed path, not one derived from $0: this file is only ever installed at
+# /opt/baxters/remotedexter/run.sh, and a launcher that went looking for its
+# binary relative to however it was invoked could be pointed somewhere else.
+# host_app's tests check this path against scripts/build-deb.sh.
+BIN=/opt/baxters/remotedexter/host_app
 [ -x "$BIN" ] || { echo "remotedexter: $BIN is missing or not executable" >&2; exit 1; }
 
 scrubbed=0
@@ -45,6 +52,22 @@ if [ -n "${XDG_DATA_DIRS:-}" ]; then
     done
     export XDG_DATA_DIRS="$kept"
 fi
+
+# ── display backend: stated, as A1 s3 requires of every launcher ─────────
+#
+# RemoteDexter captures the screen through the ScreenCast portal and PipeWire,
+# so it is never forced onto X11 -- the contract names it beside SOC Ultralight,
+# which under X11 captured solid black and logged nothing. The VS Code snap
+# exports GDK_BACKEND=x11 into every integrated terminal, and the scrub above
+# cannot see it: the value is "x11", not a path. So an inherited one is removed
+# here, and the removal is said out loud.
+if [ -n "${GDK_BACKEND:-}" ]; then
+    echo "remotedexter: removing inherited GDK_BACKEND=$GDK_BACKEND -- the host captures through the portal and is never forced onto X11"
+    unset GDK_BACKEND
+fi
+# Leaks from the VS Code Electron host and turns any Electron child into bare
+# Node. RemoteDexter starts none; clearing it is the layer-wide rule (A1 s3).
+unset ELECTRON_RUN_AS_NODE
 
 # ── capabilities ────────────────────────────────────────────────────────
 #

@@ -27,10 +27,14 @@ sitting at the machine: logind puts an ACL on the node for the user of the
 
 | file | installed to | owner | notes |
 |---|---|---|---|
-| `70-remotedexter-uinput.rules` | `/usr/share/remotedexter/` | `root:root 0644` | **inert package data.** Not under `/etc/udev/rules.d`. |
-| `remotedexter-enable-input` | `/usr/libexec/remotedexter/` | `root:root 0755` | the only privileged operation |
+| `70-remotedexter-uinput.rules` | `/opt/baxters/remotedexter/` | `root:root 0644` | **inert package data.** Not under `/etc/udev/rules.d` or `/usr/lib/udev/rules.d`, so udev never reads it until **Enable input** copies it out. |
+| `remotedexter-enable-input` | `/opt/baxters/remotedexter/` | `root:root 0755` | the only privileged operation |
 | `debian/postinst` | maintainer script | — | deliberately inert |
 | `debian/postrm` | maintainer script | — | removes the optional rule on `purge` only |
+
+The whole package lives under `/opt/baxters/remotedexter/` (the Baxters packaging
+contract, A1). The only files outside it are the desktop entry, its icons, this
+documentation and `/usr/bin/remotedexter`, a symlink to the launcher.
 
 Installing the package changes **no** device ACL, group membership, udev rule,
 unit, process, socket or key. The rule reaches `/etc/udev/rules.d` only when the
@@ -41,7 +45,7 @@ user presses **Enable input** in the host UI.
 The UI runs
 
 ```sh
-pkexec /usr/libexec/remotedexter/remotedexter-enable-input enable
+pkexec /opt/baxters/remotedexter/remotedexter-enable-input enable
 ```
 
 `pkexec` with no shipped `.policy` file falls back to
@@ -136,6 +140,14 @@ reboot). The host UI shows that state as itself and does not say "enabled".
   root-owned file whose bytes match what RemoteDexter installs. A file that has
   been edited or replaced is left alone and reported, and the purge still
   succeeds.
+* **Upgrading from the standalone `remotedexter` package (3.0.x).** Installing
+  `baxters-remotedexter` removes it, and a grant made under it stays in place:
+  the new helper recognises the same rule as its own. dpkg keeps the old
+  package's record in the "config-files" state (`rc`), and purging that
+  leftover later (`apt purge remotedexter`) runs the OLD package's purge, which
+  removes the grant as well. It fails closed -- access is taken away, never
+  added -- and the console then shows input as not enabled; **Enable input**
+  turns it back on. Measured in BaxtersVMHarness on 2026-11-01, three runs.
 
 Building the actual `.deb` — control file, install paths, zero-idle-footprint
 verification — belongs to Block 13. Block 7 ships the rule, the helper, the two

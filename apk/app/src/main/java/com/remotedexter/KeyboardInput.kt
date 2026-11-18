@@ -52,6 +52,38 @@ object KeyboardInput {
     /** Set 1 scan code for Backspace. */
     const val SCAN_BACKSPACE = 14
 
+    /**
+     * The most characters the host types in one run: a paragraph.
+     *
+     * The host's `module10::keymap::MAX_TEXT_CHARS`, and pinned to it through
+     * `limits.max_text_chars` in `contract/android_input_wire_v1.json`, which
+     * both suites assert. Counted the way the host counts — Unicode code
+     * points, not UTF-16 units — and Go's Enter included, because the host
+     * types it.
+     *
+     * Enforced HERE as well as there because the host's refusal arrives after
+     * the text has left the phone. Checking first means an over-long paragraph
+     * never leaves the compose field at all.
+     */
+    const val MAX_TEXT_CHARS = 2000
+
+    /**
+     * The most bytes one text command may encode to: the 4 KiB `InputV1`
+     * envelope the native client frames every `input_event` in.
+     *
+     * Checked HERE because nobody else can say no in time. The native session
+     * loop drops a command it cannot frame — with a log line — AFTER
+     * `sendCommand` has already returned true, so the compose field would
+     * clear and the paragraph vanish with no answer ever coming. Ordinary
+     * prose of [MAX_TEXT_CHARS] characters is about half this; text dense with
+     * quotes, backslashes, slashes or line breaks (two bytes each once
+     * escaped), or with emoji and accented letters, can reach it first.
+     *
+     * Pinned to `limits.input_v1_max_payload` in the shared contract, which
+     * the host's suite asserts against `wire::Kind::InputV1`.
+     */
+    const val MAX_INPUT_COMMAND_BYTES = 4096
+
     /** What the caller should put on the wire. */
     sealed class Action {
         /** Send this text. */
@@ -62,6 +94,38 @@ object KeyboardInput {
 
         /** Send nothing. [why] is for the log, never the user's own text. */
         data class Drop(val why: String) : Action()
+
+        /**
+         * Send nothing: [length] characters is more than the host types in one
+         * run. The compose field keeps the text so it can be shortened.
+         */
+        data class TooLong(val length: Int, val max: Int) : Action()
+
+        /**
+         * Send nothing: under the character limit, but [bytes] once encoded,
+         * more than one input message carries. The field keeps the text.
+         */
+        data class TooLargeToSend(val bytes: Int, val max: Int) : Action()
+    }
+
+    /** Characters as the host counts them: code points, so an emoji is one. */
+    fun characterCount(text: String): Int = text.codePointCount(0, text.length)
+
+    /**
+     * Bytes [text] occupies as a command — measured with the encoder that
+     * builds the real one, under the longest id a run can have, so the check
+     * can only be stricter than what is sent, never looser.
+     */
+    fun encodedCommandBytes(windowId: Long, text: String): Int =
+        InputJson.text(windowId, text, Long.MAX_VALUE).toByteArray(Charsets.UTF_8).size
+
+    /** [text] if the host would take it in one run, otherwise why not. */
+    private fun bounded(windowId: Long, text: String): Action {
+        val n = characterCount(text)
+        if (n > MAX_TEXT_CHARS) return Action.TooLong(n, MAX_TEXT_CHARS)
+        val bytes = encodedCommandBytes(windowId, text)
+        if (bytes > MAX_INPUT_COMMAND_BYTES) return Action.TooLargeToSend(bytes, MAX_INPUT_COMMAND_BYTES)
+        return Action.SendText(text)
     }
 
     /**
@@ -76,7 +140,7 @@ object KeyboardInput {
             return Action.Drop(refusalReason(controlGranted, windowId))
         }
         if (added.isEmpty()) return Action.Drop("nothing typed")
-        return Action.SendText(added)
+        return bounded(windowId, added)
     }
 
     /**
@@ -107,7 +171,7 @@ object KeyboardInput {
         // An empty field still commits: pressing Enter on nothing is a
         // deliberate blank line, which at a shell prompt is how you get a fresh
         // prompt back. Swallowing it would make the key feel broken.
-        return Action.SendText(buffer + "\n")
+        return bounded(windowId, buffer + "\n")
     }
 
     /**
@@ -134,7 +198,7 @@ object KeyboardInput {
             return Action.Drop(refusalReason(controlGranted, windowId))
         }
         if (buffer.isEmpty()) return Action.Drop("nothing typed")
-        return Action.SendText(buffer)
+        return bounded(windowId, buffer)
     }
 
     /**

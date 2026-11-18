@@ -12,8 +12,13 @@ import com.remotedexter.bootstrap18.HostIdentityTrust
  * they had to become one thing.
  *
  * Kept in its own `SharedPreferences` file so clearing pairings cannot disturb
- * unrelated settings. Nothing secret is stored — an address, a port, and two
- * public keys.
+ * unrelated settings. What is stored: addresses, ports, two public keys per
+ * host — and, for a host paired through the relay, the relay's session id. That
+ * id is not a secret from the relay, but it IS a credential against it: whoever
+ * holds it can occupy the host's join slot. So it is never logged, never shown
+ * and never put in an Intent (see [RelayRoute]); like everything in this file it
+ * is app-private and excluded from backup and device transfer. No pairing token
+ * is ever stored.
  *
  * ## Forgetting one host is not unpairing this device
  *
@@ -80,20 +85,26 @@ class PairedHostRegistry(context: Context) {
      * has never heard of it, and every attempt would be refused with no way for
      * the user to tell that from a network fault.
      *
-     * Re-adding a host that is already known REPLACES its record rather than
+     * Re-adding a host that is already known UPDATES its record rather than
      * appending a second one. A host whose DHCP lease moved presents the same
      * identity at a new address, and that is an update, not a new machine.
+     *
+     * An update MERGES routes rather than replacing the record: pairing a
+     * LAN-paired host through the relay must not cost it its LAN route, and the
+     * reverse. See [PairedHostRecord.mergedWith], which also drops a route that
+     * pins a key the host no longer has. A fresh relay pairing replaces a stale
+     * session id — which is the whole remedy after a relay restart.
      */
     fun remember(record: PairedHostRecord?) {
         if (record == null) {
             RdxLog.w(TAG, "refusing to remember a malformed host record")
             return
         }
-        val kept = all().filterNot { it.identityB64 == record.identityB64 }
         prefs.edit()
-            .putString(KEY_RECORDS, PairedHostCodec.encode(kept + record))
+            .putString(KEY_RECORDS, PairedHostCodec.encode(merged(all(), record)))
             .putString(KEY_ACTIVE, record.identityB64)
             .apply()
+        // label() names the route and never the session id.
         RdxLog.i(TAG, "paired host ${record.label()} (${record.fingerprint()}…) is now active")
     }
 
@@ -146,7 +157,18 @@ class PairedHostRegistry(context: Context) {
         RdxLog.i(TAG, "migrated the single stored pairing (${record.label()}) into the host list")
     }
 
-    private companion object {
+    internal companion object {
+        /**
+         * The list after remembering [newer]: merged into its existing record in
+         * place, or appended when the host is new. Pure, so the merge that keeps
+         * a LAN route alive is tested without `SharedPreferences`.
+         */
+        fun merged(existing: List<PairedHostRecord>, newer: PairedHostRecord): List<PairedHostRecord> {
+            val at = existing.indexOfFirst { it.identityB64 == newer.identityB64 }
+            if (at < 0) return existing + newer
+            return existing.mapIndexed { i, r -> if (i == at) r.mergedWith(newer) else r }
+        }
+
         const val TAG = "PairedHostRegistry"
         const val PREFS_NAME = "paired_hosts"
         const val KEY_RECORDS = "records"

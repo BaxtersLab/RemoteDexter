@@ -149,13 +149,13 @@ fn is_snap_path(p: &Path) -> bool {
 
 /// Owner-only on the destination. `0700` for the directory, `0600` for the key.
 #[cfg(unix)]
-fn tighten(path: &Path, mode: u32) -> std::io::Result<()> {
+pub(crate) fn tighten(path: &Path, mode: u32) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
 #[cfg(not(unix))]
-fn tighten(_path: &Path, _mode: u32) -> std::io::Result<()> {
+pub(crate) fn tighten(_path: &Path, _mode: u32) -> std::io::Result<()> {
     // Windows ACLs are not mode bits; the data directory is already per-user.
     Ok(())
 }

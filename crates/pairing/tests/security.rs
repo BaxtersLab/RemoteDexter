@@ -399,8 +399,9 @@ fn an_unsupported_version_is_refused_by_number() {
         Err(DecodeError::UnsupportedVersion { found }) => assert_eq!(found, 2),
         other => panic!("expected UnsupportedVersion, got {other:?}"),
     }
-    match pairing::decode(r#"{"version":6,"port":1}"#) {
-        Err(DecodeError::UnsupportedVersion { found }) => assert_eq!(found, 6),
+    // 7 is the next version this build does not know; 6 is the both-routes invite.
+    match pairing::decode(r#"{"version":7,"port":1}"#) {
+        Err(DecodeError::UnsupportedVersion { found }) => assert_eq!(found, 7),
         other => panic!("expected UnsupportedVersion, got {other:?}"),
     }
 }

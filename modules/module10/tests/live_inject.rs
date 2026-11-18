@@ -255,6 +255,254 @@ fn assert_remote_devices(expected_present: bool) {
     panic!("RemoteDexter uinput device presence did not become {expected_present}");
 }
 
+/// RD-TEXT-1: the batch size in `keymap::TEXT_BATCH_EVENTS` rests on the
+/// kernel's per-reader evdev buffer. This measures that buffer on a real
+/// kernel instead of trusting the arithmetic in a doc comment.
+///
+/// Everything runs against the RemoteDexter keyboard's own node, EXCLUSIVELY
+/// GRABBED so no compositor receives a keystroke, read through a RAW stream so
+/// a `SYN_DROPPED` is seen rather than quietly resynchronised away.
+///
+/// The assertions are DETERMINISTIC: the reader drains on a fixed schedule
+/// counted in batches, never on a timer. A uinput write lands in the reader's
+/// buffer before `write` returns, so "the reader skipped two pauses" can be
+/// staged exactly instead of hoped for.
+///
+/// 1. **Buffer control.** Nine shifted keystrokes (72 events) into a reader
+///    that is not draining MUST overflow; otherwise nothing below could tell a
+///    batch that fits from a buffer that never fills.
+/// 2. **A paragraph, reader draining after every THIRD batch** — a compositor
+///    that missed two pauses in a row. Every key event in order, none dropped.
+/// 3. **The same paragraph, draining after every FOURTH batch** must overflow:
+///    the margin claimed in the doc comment is exactly the one the kernel has.
+/// 4. **Timing, reported only.** The paragraph paced as the host paces it, and
+///    in one burst, against a reader polling every 200 µs. Timing can flake,
+///    and a flaky assertion is a defect of its own; the deterministic runs are
+///    the proof, these are the illustration.
+///
+/// VM only (BaxtersVMHarness). Never on a seated workstation.
+#[cfg(all(target_os = "linux", feature = "linux-input"))]
+#[test]
+fn live_text_batches_fit_the_readers_evdev_buffer() {
+    use evdev::raw_stream::RawDevice;
+    use module10::inject_linux::UinputInjector;
+    use module10::keymap::{kernel_events, text_to_plan, TypedKey, MAX_TEXT_CHARS};
+    use module10::message::{InputControlMessage, KeyAction, MOD_SHIFT};
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const EV_SYN: u16 = 0;
+    const EV_KEY: u16 = 1;
+    const SYN_DROPPED: u16 = 3;
+    const KEY_LEFTSHIFT: u16 = 42;
+    const O_NONBLOCK: i32 = 0o4000;
+    // host_app's TEXT_BATCH_PAUSE. Mirrored, not imported: module10 cannot
+    // depend on the binary.
+    const BATCH_PAUSE: Duration = Duration::from_millis(2);
+
+    if std::env::var("RD_USE_HW").as_deref() != Ok("1") {
+        eprintln!("skipping live_text_batches_fit_the_readers_evdev_buffer (set RD_USE_HW=1)");
+        return;
+    }
+    let _guard = LIVE_UINPUT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut inj = UinputInjector::new().unwrap_or_else(|e| {
+        panic!(
+            "could not create uinput devices: {e}\n{}",
+            module10::inject_linux::UINPUT_GUIDANCE
+        )
+    });
+
+    let mut kb: Option<RawDevice> = None;
+    for path in inj.dev_nodes() {
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NONBLOCK)
+            .open(&path)
+        else {
+            continue;
+        };
+        let Ok(mut dev) = RawDevice::try_from(file) else {
+            continue;
+        };
+        if dev.name() == Some("RemoteDexter Keyboard") {
+            dev.grab()
+                .expect("could not exclusively grab the RemoteDexter keyboard");
+            kb = Some(dev);
+            break;
+        }
+    }
+    let kb = kb.expect("RemoteDexter Keyboard was not opened and grabbed; refusing to inject");
+    let kb = Arc::new(std::sync::Mutex::new(kb));
+
+    fn read_now(kb: &std::sync::Mutex<RawDevice>, out: &mut Vec<(u16, u16, i32)>) {
+        let mut dev = kb.lock().unwrap();
+        loop {
+            match dev.fetch_events() {
+                Ok(it) => {
+                    let before = out.len();
+                    out.extend(it.map(|e| (e.event_type().0, e.code(), e.value())));
+                    if out.len() == before {
+                        return;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
+                Err(e) => panic!("reading the keyboard node failed: {e}"),
+            }
+        }
+    }
+    let dropped =
+        |ev: &[(u16, u16, i32)]| ev.iter().any(|&(t, c, _)| t == EV_SYN && c == SYN_DROPPED);
+    let keys_only = |ev: &[(u16, u16, i32)]| -> Vec<(u16, i32)> {
+        ev.iter()
+            .filter(|e| e.0 == EV_KEY)
+            .map(|&(_, c, v)| (c, v))
+            .collect()
+    };
+    // What inject_linux writes for a keystroke: Shift around the key, each its
+    // own frame. Scan codes in the keymap's range ARE evdev codes (identity
+    // through 0x58, pinned by keymap's own test).
+    let expected = |keys: &[TypedKey]| -> Vec<(u16, i32)> {
+        let mut out = Vec::new();
+        for k in keys {
+            for (m, down) in [(&k.down, true), (&k.up, false)] {
+                let InputControlMessage::KeyEvent {
+                    scan_code,
+                    action,
+                    modifiers,
+                } = m
+                else {
+                    panic!("a text plan holds only key events")
+                };
+                assert_eq!(matches!(action, KeyAction::Down), down);
+                assert!((0x01..=0x58).contains(scan_code));
+                let shift = modifiers & MOD_SHIFT != 0;
+                let v = i32::from(down);
+                if down && shift {
+                    out.push((KEY_LEFTSHIFT, 1));
+                }
+                out.push((*scan_code, v));
+                if !down && shift {
+                    out.push((KEY_LEFTSHIFT, 0));
+                }
+            }
+        }
+        out
+    };
+    let inject_keys = |inj: &mut UinputInjector, keys: &[TypedKey]| {
+        for k in keys {
+            inj.inject(&k.down).expect("inject key down");
+            inj.inject(&k.up).expect("inject key up");
+        }
+    };
+    let settle = || std::thread::sleep(Duration::from_millis(50));
+
+    // Start clean: nothing queued from device creation.
+    settle();
+    read_now(&kb, &mut Vec::new());
+
+    // 1. The buffer control: 72 events into a reader that is not reading.
+    let nine = text_to_plan("ABCDEFGHI").unwrap();
+    inject_keys(&mut inj, &nine.keys);
+    settle();
+    let mut ev = Vec::new();
+    read_now(&kb, &mut ev);
+    assert!(
+        dropped(&ev),
+        "nine shifted keystrokes (72 events) did not overflow the reader's buffer; \
+         read {} events. The batch arithmetic rests on a buffer this kernel does not have.",
+        ev.len()
+    );
+    eprintln!("buffer control: 72 events into an idle reader -> SYN_DROPPED");
+
+    let sentence = "Typed in paced batches, Shift and all: 2,000 characters (one paragraph). ";
+    let para: String = sentence.chars().cycle().take(MAX_TEXT_CHARS).collect();
+    let plan = text_to_plan(&para).unwrap();
+    let batches = plan.batches();
+    let want = expected(&plan.keys);
+    let total_events: usize = plan.keys.iter().map(kernel_events).sum();
+
+    // 2 and 3. The reader drains only after every `every`-th batch.
+    let lockstep = |every: usize, inj: &mut UinputInjector| -> Vec<(u16, u16, i32)> {
+        let mut got = Vec::new();
+        for (i, batch) in batches.iter().enumerate() {
+            inject_keys(inj, batch);
+            if (i + 1) % every == 0 {
+                read_now(&kb, &mut got);
+            }
+        }
+        read_now(&kb, &mut got);
+        got
+    };
+    let three = lockstep(3, &mut inj);
+    assert!(
+        !dropped(&three),
+        "a reader that missed two pauses lost events: three batches did not fit"
+    );
+    assert_eq!(
+        keys_only(&three),
+        want,
+        "the paragraph arrived short or out of order"
+    );
+    eprintln!(
+        "lockstep: drained every 3rd of {} batches -> all {} key events in order, none dropped",
+        batches.len(),
+        want.len()
+    );
+
+    settle();
+    read_now(&kb, &mut Vec::new());
+    let four = lockstep(4, &mut inj);
+    assert!(
+        dropped(&four),
+        "draining only every 4th batch did not overflow; the claimed margin is not the real one"
+    );
+    eprintln!("lockstep control: drained every 4th batch -> SYN_DROPPED, so the margin is exact");
+
+    // 4. Timing, reported only.
+    let run = |paced: bool, inj: &mut UinputInjector| {
+        settle();
+        read_now(&kb, &mut Vec::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let kb = Arc::clone(&kb);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut got = Vec::new();
+                while !stop.load(Ordering::SeqCst) {
+                    read_now(&kb, &mut got);
+                    std::thread::sleep(Duration::from_micros(200));
+                }
+                read_now(&kb, &mut got);
+                got
+            })
+        };
+        let started = Instant::now();
+        for (i, batch) in batches.iter().enumerate() {
+            if paced && i > 0 {
+                std::thread::sleep(BATCH_PAUSE);
+            }
+            inject_keys(inj, batch);
+        }
+        let took = started.elapsed();
+        std::thread::sleep(Duration::from_millis(100));
+        stop.store(true, Ordering::SeqCst);
+        let got = reader.join().expect("reader thread");
+        eprintln!(
+            "{} run: {} keystrokes / {total_events} kernel events in {took:?}; \
+             {} of {} key events read; SYN_DROPPED={}",
+            if paced { "paced" } else { "burst" },
+            plan.keys.len(),
+            got.iter().filter(|e| e.0 == EV_KEY).count(),
+            want.len(),
+            dropped(&got)
+        );
+    };
+    run(true, &mut inj);
+    run(false, &mut inj);
+}
+
 /// Read everything queued on every reader. Non-blocking, so a device with
 /// nothing to say returns immediately instead of hanging the test; the settle
 /// loop covers the kernel not having flushed yet.

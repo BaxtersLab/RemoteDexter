@@ -216,7 +216,11 @@ class LifecycleStateTest {
     @Test
     fun everyFailureReasonIsDistinctAndVisible() {
         val all = FailureReason.values()
-        assertEquals("all nine plan-named failures plus the QR-kind case", 10, all.size)
+        assertEquals(
+            "all nine plan-named failures, the QR-kind case, and the relay not knowing a host",
+            11,
+            all.size
+        )
         val labels = all.map { it.label() }
         assertEquals("two failures share a label", labels.size, labels.toSet().size)
         assertTrue("a label must not be empty", labels.none { it.isBlank() })
@@ -226,7 +230,8 @@ class LifecycleStateTest {
             FailureReason.InviteExpired, FailureReason.UnsupportedAbi,
             FailureReason.Network, FailureReason.NoiseHandshake,
             FailureReason.PairingRefused, FailureReason.Authorization,
-            FailureReason.Stream, FailureReason.QrNotPairingCode
+            FailureReason.Stream, FailureReason.QrNotPairingCode,
+            FailureReason.RelaySessionUnknown
         ).forEach { assertTrue(all.contains(it)) }
     }
 
@@ -240,6 +245,8 @@ class LifecycleStateTest {
     fun retryIsOfferedOnlyWhereItCouldSucceed() {
         assertTrue(FailureReason.Network.isRetryable())
         assertTrue(FailureReason.Stream.isRetryable())
+        // A host that was not connected to the relay may be now.
+        assertTrue(FailureReason.RelaySessionUnknown.isRetryable())
         listOf(
             FailureReason.InviteSignature, FailureReason.InviteExpired,
             FailureReason.PairingRefused, FailureReason.UnsupportedAbi,

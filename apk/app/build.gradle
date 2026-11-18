@@ -90,6 +90,11 @@ android {
         // cannot leave a stale control claim or accept requests while idle.
         // 3.0.13 is the landscape control column, the scroll buttons, the
         // two-finger right click, and the four input-release paths.
+        // 3.1.0 reaches a host that is not on the same network: through a relay
+        // that carries the session sealed, with pairing codes that can carry both
+        // routes and a paired phone that reconnects without a new QR. Its source
+        // offer points at the GitHub repository. versionCode 15, because the
+        // published 3.0.13 is 14 and a phone refuses anything not past it.
         //
         // THE BUMP ABOVE IS NO LONGER THE ONLY THING KEEPING BUILDS APART, and
         // it should not have been. Five days of work — the layout rework, the
@@ -103,8 +108,8 @@ android {
         //
         // `buildStamp()` appends the commit the artifact was built from, so
         // every build identifies itself whether or not anyone remembered.
-        versionCode 14
-        versionName "3.0.13+" + buildStamp()
+        versionCode 16
+        versionName "3.1.0.1+" + buildStamp()
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -226,6 +231,10 @@ dependencies {
     // org.json is stubbed to throw in unit tests, so the platform class cannot
     // be used here; this is the reference implementation it was derived from.
     testImplementation 'org.json:json:20240303'                          // Public Domain — test scope
+    // The decoder the scan screen uses (zxing-android-embedded pulls this same
+    // version), declared here so QrModulesTest can read the host's QR grids
+    // exactly as the phone would, whatever the scanner library exposes.
+    testImplementation 'com.google.zxing:core:3.4.1'                    // Apache-2.0 — test scope
 
     // On-device tests. SurfaceTouchRouter's behaviour is Android's — whether
     // GestureDetector fires onLongPress, and whether ACTION_CANCEL is delivered

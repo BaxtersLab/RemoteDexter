@@ -159,13 +159,40 @@ struct Console {
     /// Cheap reconciliation clock. The device is the authority on whether we
     /// can inject, but asking it ten times a second is silly.
     grant_checked: Instant,
-    /// Whether a relay is configured for this host.
+    /// Where the stored settings live, so a toggle can write them.
+    settings_path: std::path::PathBuf,
+    /// The stored settings as last read or written. The session loop reads its
+    /// own copy through `settings::granted`; this one is what is drawn.
+    settings: crate::settings::Settings,
+    /// Why the last settings write failed, if it did. Shown rather than
+    /// swallowed: a permission the console shows and the file does not carry
+    /// would be a lie after a restart.
+    settings_fault: Option<String>,
+    /// What this host knows about its relay.
     ///
-    /// Not "is dial-out possible in principle" — whether THIS process was given
-    /// a relay and a credential. With none, the button is absent rather than
-    /// present and failing, because a control that cannot work is a control the
-    /// operator has to test to understand.
-    relay_configured: bool,
+    /// Not "is dial-out possible in principle" — what THIS process was given.
+    /// With no relay the button is absent rather than present and failing,
+    /// because a control that cannot work is a control the operator has to test
+    /// to understand. With a relay that is configured WRONGLY the reason is
+    /// shown, because an absent button and a broken one look identical.
+    relay: crate::relay_dial::RelayPlan,
+    /// What the operator has typed into the relay address box, which is not yet
+    /// what is stored. Seeded from the plan so the common case is one click.
+    relay_input: String,
+    /// The last retry the controller announced, cleared as soon as the host is
+    /// serving. Kept out of `fault`: a relay that is briefly unreachable is an
+    /// ordinary event, and showing it in red teaches the operator to ignore red.
+    relay_retry: Option<String>,
+    /// Why the relay last REFUSED this host, until a new attempt or a
+    /// connection makes it history. Distinct from `relay_retry`: a refusal
+    /// needs a human and a retry does not, so they are never shown alike.
+    relay_refused: Option<String>,
+    /// Set once the first-time explanation for dialling on start has been shown
+    /// and answered. The explanation is shown BEFORE the setting is written,
+    /// never after.
+    dial_on_start_prompt: bool,
+    /// Whether `dial_on_start` has already fired this run.
+    startup_relay_sent: bool,
 }
 
 impl Console {
@@ -174,7 +201,9 @@ impl Console {
         fingerprint: String,
         startup_bind: Option<SocketAddr>,
         devices: pairing::devices::DeviceHandle,
-        relay_configured: bool,
+        relay: crate::relay_dial::RelayPlan,
+        settings_path: std::path::PathBuf,
+        settings: crate::settings::Settings,
     ) -> Self {
         let interfaces = interfaces();
         let selected = startup_bind.and_then(|bind| {
@@ -182,6 +211,14 @@ impl Console {
                 .iter()
                 .position(|interface| interface.ip == bind.ip())
         });
+        // Seeded from what is in force, stored or not, so an operator running
+        // with RD_RELAY can remember that relay with one click instead of
+        // retyping an address they have already typed once.
+        let relay_input = relay
+            .address()
+            .map(|a| a.to_string())
+            .or_else(|| settings.relay.address.clone())
+            .unwrap_or_default();
         Console {
             devices,
             host,
@@ -202,7 +239,72 @@ impl Console {
             grant_rx: None,
             grant_checked: Instant::now(),
             test_revoke: TestRevokeTrigger::from_env(),
-            relay_configured,
+            settings_path,
+            settings,
+            settings_fault: None,
+            relay,
+            relay_input,
+            relay_retry: None,
+            relay_refused: None,
+            dial_on_start_prompt: false,
+            startup_relay_sent: false,
+        }
+    }
+
+    /// Allow or revoke a capability: write it down, then show what was written.
+    ///
+    /// The file is the authority. If the write fails nothing is granted, the
+    /// reason is shown, and the console keeps showing the truth.
+    fn change_capability(&mut self, cap: crate::settings::Capability, allow: bool) {
+        let result = if allow {
+            crate::settings::allow(&self.settings_path, cap)
+        } else {
+            crate::settings::revoke(&self.settings_path, cap)
+        };
+        self.record_change(result);
+    }
+
+    /// Remember a relay address, or forget the one stored.
+    fn change_relay_address(&mut self, address: Option<&str>) {
+        let result = crate::settings::set_relay_address(&self.settings_path, address);
+        let stored_ok = result.is_ok();
+        self.record_change(result);
+        if stored_ok {
+            // The plan is what the console shows everywhere else, and it must
+            // not keep describing the address that was there a moment ago. The
+            // DIALLER is not rebuilt: the controller holds it, and a relay this
+            // host is already dialling is not changed underneath the operator.
+            // The new address is what the next run dials.
+            self.relay =
+                crate::relay_dial::plan(&self.settings.relay, |name| std::env::var(name).ok());
+        }
+    }
+
+    /// Turn "connect through the relay whenever RemoteDexter starts" on or off.
+    fn change_dual_route_codes(&mut self, on: bool) {
+        let result = crate::settings::set_dual_route_codes(&self.settings_path, on);
+        self.record_change(result);
+    }
+
+    fn change_dial_on_start(&mut self, on: bool) {
+        let result = crate::settings::set_dial_on_start(&self.settings_path, on);
+        self.record_change(result);
+    }
+
+    /// Take the outcome of a settings write: refresh what is drawn, or show why
+    /// nothing changed.
+    ///
+    /// The file is the authority. If the write fails nothing is in force, the
+    /// reason is shown, and the console keeps showing the truth — a setting the
+    /// console displayed and the disk did not carry would be a lie after a
+    /// restart, which is exactly the class of bug this file exists to end.
+    fn record_change(&mut self, result: Result<(), crate::settings::SaveError>) {
+        match result {
+            Ok(()) => {
+                self.settings = crate::settings::current();
+                self.settings_fault = None;
+            }
+            Err(e) => self.settings_fault = Some(e.message()),
         }
     }
 
@@ -329,23 +431,56 @@ impl Console {
 
     fn drain_events(&mut self) {
         while let Some(evt) = self.host.try_next_event() {
+            // Said out loud before it is drawn. The window is not always where
+            // the operator is looking, and a host started from a terminal
+            // reports to that terminal.
+            if let Some(note) = terminal_note(&evt) {
+                eprintln!("[host] {note}");
+            }
+            if !invite_outlives(&evt) {
+                self.invite = None;
+                self.qr_texture = None;
+            }
             match evt {
                 HostEvent::StateChanged(s) => {
                     if !matches!(s, HostState::Error { .. }) {
                         self.fault = None;
                     }
+                    // The retry line describes an attempt in progress. Once the
+                    // relay is connected, or the host has stopped trying, it is
+                    // history — and a stale "retrying" under a live relay would
+                    // be the console contradicting itself.
+                    if !retry_line_is_current(&s) {
+                        self.relay_retry = None;
+                    }
+                    if s.reach().and_then(|r| r.relay()).is_some() {
+                        self.relay_refused = None;
+                    }
                     if matches!(s, HostState::Stopped) {
                         self.peers.clear();
-                        // The invitation died with the listener; stop showing a
-                        // QR that names a port nothing is on.
-                        self.invite = None;
-                        self.qr_texture = None;
                     }
                     self.state = s;
                 }
                 HostEvent::PeerConnected { peer, .. } => self.peers.push(peer),
                 HostEvent::PeerDisconnected { peer, .. } => self.peers.retain(|p| *p != peer),
                 HostEvent::InviteReady(view) => self.invite = Some(view),
+                // Already cleared above, by `invite_outlives`.
+                HostEvent::InviteWithdrawn => {}
+                HostEvent::RelayRetrying {
+                    attempt,
+                    in_seconds,
+                    why,
+                } => {
+                    // Printed by `terminal_note` above, with every other
+                    // event worth a line, so there is one place that decides
+                    // what the terminal hears.
+                    self.relay_retry = Some(relay_retry_line(attempt, in_seconds, &why));
+                    self.relay_refused = None;
+                }
+                HostEvent::RelayRefused { why } => {
+                    self.relay_refused = Some(why);
+                    self.relay_retry = None;
+                }
                 HostEvent::Fault { message } => self.fault = Some(message),
             }
         }
@@ -368,6 +503,22 @@ impl eframe::App for Console {
         self.drain_grant();
         self.reconcile_grant();
         self.poll_test_revoke_trigger();
+        // "Connect through the relay whenever RemoteDexter starts", the stored
+        // choice. Once per run, and only when the owner has said so: the
+        // default is off, and a fresh install dials nothing.
+        //
+        // Dialling out is not sharing. Nothing is captured, injected or offered
+        // by this — the host holds one outbound connection and waits, and a
+        // phone still has to pair before anything crosses it.
+        if self.settings.relay.dial_on_start
+            && !self.startup_relay_sent
+            && self.startup_bind.is_none()
+            && self.relay.address().is_some()
+        {
+            let _ = self.host.send(HostCommand::StartViaRelay);
+            self.relay_refused = None;
+            self.startup_relay_sent = true;
+        }
         if let Some(bind) = self.startup_bind {
             if !self.startup_sent {
                 let _ = self.host.send(HostCommand::Start { bind });
@@ -414,7 +565,7 @@ impl eframe::App for Console {
                         "\u{25cf} Stopped",
                         "No listener. Nothing is shared.".to_string(),
                     ),
-                    HostState::Starting => ("\u{25cf} Starting", "Binding…".to_string()),
+                    HostState::Starting => ("\u{25cf} Starting", "Starting…".to_string()),
                     HostState::Pairable { reach } => (
                         "\u{25cf} Pairable",
                         format!("{} — no device connected", reach_detail(reach)),
@@ -428,6 +579,23 @@ impl eframe::App for Console {
                 };
                 ui.label(egui::RichText::new(dot).strong());
                 ui.label(detail);
+                if let Some(line) = relay_line(
+                    self.relay.address().is_some(),
+                    &self.state,
+                    self.relay_retry.as_deref(),
+                    self.relay_refused.as_deref(),
+                ) {
+                    let text = egui::RichText::new(line.text());
+                    ui.label(match line {
+                        RelayLine::Refused(_) => {
+                            text.color(egui::Color32::from_rgb(0xC0, 0x39, 0x2B)).strong()
+                        }
+                        RelayLine::Reconnecting(_) => {
+                            text.color(egui::Color32::from_rgb(0xB5, 0x6A, 0x00))
+                        }
+                        _ => text,
+                    });
+                }
 
                 // ── capture health, separate from the connection ─────────
                 //
@@ -462,18 +630,21 @@ impl eframe::App for Console {
                 ui.separator();
 
                 // ── interface selection ──────────────────────────────────
-                // `is_running`, NOT `is_listening`: a host that dialled out to
-                // a relay is serving and must not offer to change interface,
-                // even though it is listening on nothing.
-                let running = self.state.is_running() || matches!(self.state, HostState::Starting);
-                // The picker is already disabled while running, so once a
+                // Choosable whenever a listener could be started: before
+                // anything runs, and beside a relay (P5: the LAN route is added
+                // by a click and the host serves both). Not while listening —
+                // moving to another interface is Stop listening, then Start.
+                let c = controls(&self.state, self.shutting_down);
+                // The picker is disabled while listening, so once a
                 // pairing code is on screen it is inert furniture competing
                 // with the credential for vertical room. Round 10 measured
                 // that competition at 1 px/module.
-                if !(running && self.invite.is_some()) {
+                if !(self.state.is_listening() && self.invite.is_some()) {
                     ui.add_space(6.0);
                     ui.label("Network interface");
-                    ui.add_enabled_ui(!running, |ui| {
+                    // Choosable whenever a listener could be started — which
+                    // now includes a host serving through the relay.
+                    ui.add_enabled_ui(c.start.is_some(), |ui| {
                         let current = self
                             .selected
                             .and_then(|i| self.interfaces.get(i))
@@ -498,36 +669,143 @@ impl eframe::App for Console {
                 // ── start / stop ─────────────────────────────────────────
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    let can_start = !running && self.selected_addr().is_some() && !self.shutting_down;
+                    let can_start = c.start.is_some() && self.selected_addr().is_some();
                     if ui
-                        .add_enabled(can_start, egui::Button::new("Start host"))
+                        .add_enabled(can_start, egui::Button::new(c.start.unwrap_or("Start host")))
                         .clicked()
                     {
                         if let Some(bind) = self.selected_addr() {
                             let _ = self.host.send(HostCommand::Start { bind });
                         }
                     }
+                    // Closes the port and the LAN sessions, and keeps the relay.
+                    // Offered only while listening; enabled only beside a relay,
+                    // because on its own it would be Stop host under another name.
+                    if self.state.is_listening()
+                        && ui
+                            .add_enabled(c.stop_listening, egui::Button::new("Stop listening"))
+                            .on_disabled_hover_text(
+                                "The listener is this host's only route — use Stop host.",
+                            )
+                            .clicked()
+                    {
+                        let _ = self.host.send(HostCommand::StopListening);
+                    }
                     if ui
-                        .add_enabled(running, egui::Button::new("Stop host"))
+                        .add_enabled(c.stop, egui::Button::new("Stop host"))
                         .clicked()
                     {
                         let _ = self.host.send(HostCommand::Stop);
                     }
-                    // Only shown when a relay is actually configured. Dialling
-                    // out BINDS NOTHING: the host opens an outbound connection
-                    // and no port is opened here at all.
-                    if self.relay_configured {
-                        let can_dial = !running && !self.shutting_down;
+                    // Only shown when a relay is actually usable. Dialling out
+                    // BINDS NOTHING: the host opens an outbound connection and
+                    // no port is opened here at all.
+                    if self.relay.address().is_some() {
                         if ui
-                            .add_enabled(can_dial, egui::Button::new("Connect via relay"))
+                            .add_enabled(
+                                c.dial.is_some(),
+                                egui::Button::new(c.dial.unwrap_or("Connect via relay")),
+                            )
                             .clicked()
                         {
                             let _ = self.host.send(HostCommand::StartViaRelay);
+                            self.relay_refused = None;
                         }
                     }
                 });
-                if !running && self.selected_addr().is_none() {
+                if c.start.is_some() && self.selected_addr().is_none() {
                     ui.small("Choose an interface to enable Start.");
+                }
+
+                // ── relay ────────────────────────────────────────────────
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Relay").strong());
+                ui.small(self.relay.summary());
+                ui.small(
+                    "A relay lets a phone reach this host from anywhere. It carries the session \
+                     sealed — it cannot read your screen, your keystrokes or your clipboard.",
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Address");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.relay_input)
+                            .hint_text("203.0.113.9:9443")
+                            .desired_width(200.0),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    let typed = self.relay_input.trim().to_string();
+                    let stored = self.settings.relay.address.clone().unwrap_or_default();
+                    let can_remember = !typed.is_empty() && typed != stored;
+                    if ui
+                        .add_enabled(can_remember, egui::Button::new("Remember this relay"))
+                        .clicked()
+                    {
+                        self.change_relay_address(Some(&typed));
+                    }
+                    if ui
+                        .add_enabled(!stored.is_empty(), egui::Button::new("Forget"))
+                        .clicked()
+                    {
+                        self.relay_input.clear();
+                        self.change_relay_address(None);
+                    }
+                });
+
+                // "Connect on start". Off until the owner says otherwise, and
+                // the first time they say it they are told what it means.
+                let stored_on = self.settings.relay.dial_on_start;
+                let blocked = dial_on_start_blocked(&self.settings.relay, &self.relay);
+                let asking = self.dial_on_start_prompt;
+                let mut ticked = stored_on;
+                let changed = ui
+                    .add_enabled(
+                        blocked.is_none() && !asking,
+                        egui::Checkbox::new(
+                            &mut ticked,
+                            "Connect through the relay whenever RemoteDexter starts",
+                        ),
+                    )
+                    .changed();
+                if changed {
+                    if ticked {
+                        // Explain BEFORE writing it, never after. The setting
+                        // is what makes this machine announce itself to someone
+                        // else's server every time it runs.
+                        self.dial_on_start_prompt = true;
+                    } else {
+                        self.change_dial_on_start(false);
+                    }
+                }
+                if let Some(why) = &blocked {
+                    ui.small(why);
+                } else if stored_on {
+                    ui.small(
+                        "RemoteDexter connects to the relay when it starts. Nothing is shared \
+                         until a phone you have paired connects.",
+                    );
+                }
+                if asking {
+                    ui.add_space(4.0);
+                    ui.small(
+                        "While RemoteDexter runs it will hold an outbound connection to this \
+                         relay. The relay's operator can see that this host is online, for how \
+                         long, and how many bytes crossed — never what they are. It still shares \
+                         nothing: no screen, no input, no clipboard, until a phone you paired \
+                         connects and you allow it.",
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("Connect on start").clicked() {
+                            self.change_dial_on_start(true);
+                            self.dial_on_start_prompt = false;
+                        }
+                        if ui.button("Not now").clicked() {
+                            self.dial_on_start_prompt = false;
+                        }
+                    });
                 }
 
                 // ── pairing ──────────────────────────────────────────────
@@ -549,6 +827,14 @@ impl eframe::App for Console {
                 if !can_invite {
                     ui.small("Start the host to create a pairing code.");
                 }
+                let mut dual = self.settings.pairing.dual_route_codes;
+                if ui
+                    .checkbox(&mut dual, "Pairing codes carry both routes")
+                    .changed()
+                {
+                    self.change_dual_route_codes(dual);
+                }
+                ui.small(dual_route_note(dual));
                 if let Some(inv) = &self.invite {
                     // Rebuild the texture only when the invite actually changes:
                     // this runs ten times a second.
@@ -604,8 +890,8 @@ impl eframe::App for Console {
                         }
                     }
                     ui.small(format!(
-                        "Scan within 60 seconds. Code {} expires at {}.",
-                        inv.token_fingerprint, inv.expires_at
+                        "Scan within 60 seconds. Code {} names {} and expires at {}.",
+                        inv.token_fingerprint, inv.carries, inv.expires_at
                     ));
                     ui.small(
                         "Anyone who can see this screen can use this code. Press Stop, or \
@@ -712,6 +998,44 @@ impl eframe::App for Console {
                         );
                     }
 
+                    // ── what this host may do ────────────────────────────────
+                    // Standing permissions, and the date each was given. A
+                    // grant that survives a restart must be visible, and one
+                    // click must be enough to take it back.
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("What this host may do").strong());
+                    for cap in crate::settings::Capability::ALL {
+                        let env_grants = std::env::var(cap.env_var()).as_deref() == Ok("1");
+                        let view = crate::settings::grant_view(cap, &self.settings, env_grants);
+                        ui.add_space(4.0);
+                        ui.label(view.headline);
+                        ui.small(view.detail);
+                        match view.action {
+                            crate::settings::GrantAction::Allow => {
+                                if ui.small_button(format!("Allow {}", cap.label().to_lowercase())).clicked() {
+                                    self.change_capability(cap, true);
+                                }
+                            }
+                            crate::settings::GrantAction::Revoke => {
+                                if ui.small_button("Revoke").clicked() {
+                                    self.change_capability(cap, false);
+                                }
+                            }
+                            // Nothing to offer: the variable, not this file,
+                            // is what the session loop is reading.
+                            crate::settings::GrantAction::EnvironmentHolds => {}
+                        }
+                    }
+                    if let Some(fault) = &self.settings_fault {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0xC0, 0x70, 0x20),
+                            format!("\u{26a0} settings not saved: {fault}"),
+                        );
+                    }
+                    ui.small(format!("Stored in {}", self.settings_path.display()));
+
                     // ── input access ─────────────────────────────────────────
                     // The host can stream a screen without this; it cannot move a
                     // pointer without it. Saying which is true is the whole feature.
@@ -810,22 +1134,31 @@ pub fn run(
     fingerprint: String,
     startup_bind: Option<SocketAddr>,
     devices: pairing::devices::DeviceHandle,
+    settings_path: std::path::PathBuf,
+    settings: crate::settings::Settings,
 ) -> Result<(), eframe::Error> {
-    // A relay is configured or it is not. When it is not, this is exactly the
-    // controller that existed before: `StartViaRelay` is refused because there
-    // is no route, rather than silently falling back to binding.
-    let relay_configured = crate::relay_dial::RelayDialOut::from_env().is_some();
-    let host = match crate::relay_dial::RelayDialOut::from_env() {
+    // A relay is configured or it is not, and it is worked out ONCE: the
+    // console and the controller must not be able to disagree about whether
+    // this host has a relay. When it has none, this is exactly the controller
+    // that existed before — `StartViaRelay` is refused because there is no
+    // route, rather than silently falling back to binding.
+    let relay = crate::relay_dial::RelayDialOut::configure(
+        &settings.relay,
+        |name| std::env::var(name).ok(),
+        crate::host_signing_identity(),
+    );
+    if let crate::relay_dial::RelayPlan::Unusable { why, .. } = &relay.plan {
+        // Said out loud as well as shown. A host launched from the icon with a
+        // broken relay is one whose operator is looking at a window, but a host
+        // launched from a terminal is one whose operator is looking at a log.
+        eprintln!("[host] no relay is usable: {why}");
+    }
+    let plan = relay.plan.clone();
+    let host = match relay.dial_out {
         Some(dial_out) => host_controller::spawn_with_dial_out(build_backend, dial_out),
         None => host_controller::spawn_with(build_backend),
     };
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([520.0, 640.0])
-            .with_min_inner_size([440.0, 520.0])
-            .with_title("RemoteDexter — host"),
-        ..Default::default()
-    };
+    let options = native_options();
     eframe::run_native(
         "RemoteDexter",
         options,
@@ -835,7 +1168,9 @@ pub fn run(
                 fingerprint,
                 startup_bind,
                 devices,
-                relay_configured,
+                plan,
+                settings_path,
+                settings,
             )))
         }),
     )
@@ -1062,27 +1397,316 @@ pub(crate) fn reach_detail(reach: &Reach) -> String {
         Reach::ViaRelay { relay, .. } => {
             format!("Reachable through relay {relay} — nothing is listening here")
         }
+        Reach::Both { bound, relay, .. } => {
+            format!("Listening on {bound}, and reachable through relay {relay}")
+        }
     }
+}
+
+/// Whether a pairing code on screen is still worth showing after `event`.
+///
+/// It dies with the host, and with any route it may name: the controller
+/// withdraws it when one of a running host's routes goes away. Showing it after
+/// either is showing a QR for a port nothing is on, or a session the relay has
+/// forgotten.
+pub(crate) fn invite_outlives(event: &HostEvent) -> bool {
+    !matches!(
+        event,
+        HostEvent::StateChanged(HostState::Stopped) | HostEvent::InviteWithdrawn
+    )
 }
 
 pub(crate) fn admin_sections_visible(_invite_displayed: bool) -> bool {
     true
 }
 
-/// Whether the cached QR image still depicts the current invitation.
+/// What the console says while a relay is being retried.
 ///
-/// Keyed on the invitation's fingerprint, **not** its pixel size. Two different
-/// invitations are almost always the same number of modules, so a size
-/// comparison cannot tell them apart: minting a fresh code leaves the cache
-/// looking valid and the panel goes on showing the previous, expiring QR while
-/// the log correctly reports a new token. Observed on Windows on 2026-08-26 —
-/// repeated "Create pairing QR" produced codes the phone rejected as expired
-/// until the host was stopped and started, which cleared the cache by dropping
-/// the invite.
+/// Says the relay is unreachable and that the host is still trying, in that
+/// order, because those are the operator's two questions. It never says the
+/// host has failed: it has not, and a line that reads like a failure would have
+/// them clicking at a console that is already doing the right thing.
+/// What a host launched from a terminal should be told about an event, or
+/// `None` when the window is the right and only place for it.
 ///
-/// The fingerprint is the short non-secret handle `InviteView` already exposes
-/// for log correlation; the modules themselves are the token and never leave
-/// the widget.
+/// **Why this exists.** As P3 shipped, a relay that connected said nothing, a
+/// relay that REFUSED said nothing — it reached the window alone — and only a
+/// retry printed. So the one outcome needing no attention was the only one that
+/// spoke, and the operator watching a live start could not tell from stderr
+/// whether it had worked. Found by running it, not by the gate.
+///
+/// Ordinary session traffic stays out: a peer connecting is the window's job,
+/// and a line per peer would bury the two lines that matter.
+pub(crate) fn terminal_note(event: &HostEvent) -> Option<String> {
+    match event {
+        HostEvent::StateChanged(HostState::Pairable { reach }) => Some(reach_detail(reach)),
+        // Every fault, not just the relay's. A fault is by definition something
+        // the operator may have to act on, and the window is not always where
+        // they are looking.
+        HostEvent::Fault { message } => Some(message.clone()),
+        HostEvent::RelayRetrying {
+            attempt,
+            in_seconds,
+            why,
+        } => Some(relay_retry_line(*attempt, *in_seconds, why)),
+        HostEvent::RelayRefused { why } => Some(relay_refused_line(why)),
+        _ => None,
+    }
+}
+
+/// What the start/stop row offers, decided from the host's state alone.
+///
+/// A host can now serve the LAN and the relay at once, so each route has its
+/// own way on and off: Start adds a listener beside a relay, Connect via relay
+/// adds the relay beside a listener, Stop listening closes only the port, and
+/// Stop host ends everything. A listener is still only ever opened by a click.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Controls {
+    /// The Start button's label when a listener could be started now.
+    pub start: Option<&'static str>,
+    /// Whether Stop listening would leave the host serving through the relay.
+    pub stop_listening: bool,
+    /// The relay button's label when a dial could be started now.
+    pub dial: Option<&'static str>,
+    /// Whether Stop host has anything to stop.
+    pub stop: bool,
+}
+
+pub(crate) fn controls(state: &HostState, shutting_down: bool) -> Controls {
+    let busy = shutting_down || matches!(state, HostState::Stopping);
+    let running = state.is_running();
+    let starting = matches!(state, HostState::Starting);
+    let listening = state.is_listening();
+    let relayed = state.reach().and_then(|r| r.relay()).is_some();
+    Controls {
+        start: (!listening && !busy).then_some(if running {
+            "Also listen on this interface"
+        } else {
+            "Start host"
+        }),
+        stop_listening: listening && relayed && !busy,
+        dial: (!relayed && !starting && !busy).then_some(if running {
+            "Also connect via relay"
+        } else {
+            "Connect via relay"
+        }),
+        stop: (running || starting) && !busy,
+    }
+}
+
+/// What the "Pairing codes carry both routes" setting means, in the window.
+pub(crate) fn dual_route_note(on: bool) -> &'static str {
+    if on {
+        "While this host is listening AND connected to the relay, a new code names both, and \
+         the phone uses whichever answers first. Only the RemoteDexter app from this release \
+         reads it; an older app says the code needs a newer one."
+    } else {
+        "A code names one route: the relay while it is connected, otherwise the network \
+         interface. Every RemoteDexter app reads it."
+    }
+}
+
+/// What the console says about the relay, in one line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RelayLine {
+    /// Connected to this relay.
+    Connected(SocketAddr),
+    /// A first dial is in progress.
+    Connecting,
+    /// Unreachable, and being tried again. Carries the retry line.
+    Reconnecting(String),
+    /// Refused this host; nothing will retry. Carries the relay's reason.
+    Refused(String),
+    /// Configured, and nothing is connected or in progress.
+    NotConnected,
+}
+
+impl RelayLine {
+    pub(crate) fn text(&self) -> String {
+        match self {
+            RelayLine::Connected(relay) => format!("Relay: connected to {relay}"),
+            RelayLine::Connecting => "Relay: connecting…".to_string(),
+            RelayLine::Reconnecting(retry) => retry.clone(),
+            RelayLine::Refused(why) => relay_refused_line(why),
+            RelayLine::NotConnected => {
+                "Relay: not connected — a phone cannot reach this host through it".to_string()
+            }
+        }
+    }
+}
+
+/// The relay's one line, or `None` for a host with no relay configured.
+///
+/// **Reconnecting and refused are never shown alike.** A relay that cannot be
+/// reached is being retried and needs nothing from the operator; a relay that
+/// refused this host will not be retried and needs a human. Found 2026-09-17:
+/// a host lost its relay at 09:32 and the console gave no way to tell which,
+/// or that anything had happened.
+pub(crate) fn relay_line(
+    relay_configured: bool,
+    state: &HostState,
+    retry: Option<&str>,
+    refused: Option<&str>,
+) -> Option<RelayLine> {
+    if !relay_configured {
+        return None;
+    }
+    if let Some((relay, _)) = state.reach().and_then(|r| r.relay()) {
+        return Some(RelayLine::Connected(relay));
+    }
+    if let Some(why) = refused {
+        return Some(RelayLine::Refused(why.to_string()));
+    }
+    if let Some(retry) = retry {
+        return Some(RelayLine::Reconnecting(retry.to_string()));
+    }
+    if matches!(state, HostState::Starting) {
+        return Some(RelayLine::Connecting);
+    }
+    Some(RelayLine::NotConnected)
+}
+
+/// Whether a retry line still describes something in progress after `state`.
+///
+/// A first dial is `Starting`; a host that lost its relay while listening keeps
+/// serving on the LAN, `Pairable` or `Connected` with no relay in its reach,
+/// while it dials again. Once the relay is connected, or the host has stopped,
+/// the line is history.
+pub(crate) fn retry_line_is_current(state: &HostState) -> bool {
+    match state {
+        HostState::Starting => true,
+        s if s.is_running() => s.reach().and_then(|r| r.relay()).is_none(),
+        _ => false,
+    }
+}
+
+pub(crate) fn relay_refused_line(why: &str) -> String {
+    format!(
+        "Relay refused this host: {why}. It will not be retried — the relay has to accept this \
+         host, or the address is wrong."
+    )
+}
+
+pub(crate) fn relay_retry_line(attempt: u32, in_seconds: u64, why: &str) -> String {
+    let again = match in_seconds {
+        0 => "trying again now".to_string(),
+        1 => "trying again in 1 second".to_string(),
+        n => format!("trying again in {n} seconds"),
+    };
+    format!("Relay unreachable ({why}) — {again}. Attempt {attempt} so far.")
+}
+
+/// Why the "connect on start" checkbox cannot be ticked, or `None` when it can.
+///
+/// Its own function because the reason must be SHOWN. A control that is greyed
+/// out with no explanation is one the operator has to experiment on to
+/// understand, and the experiment here is "restart the host and see".
+pub(crate) fn dial_on_start_blocked(
+    stored: &crate::settings::RelaySettings,
+    plan: &crate::relay_dial::RelayPlan,
+) -> Option<String> {
+    match stored.address.as_deref() {
+        None => Some(
+            "Remember a relay address first — this setting is about the relay this host \
+             connects to every time it starts."
+                .to_string(),
+        ),
+        Some(addr) if crate::settings::validated_relay_address(addr).is_err() => Some(format!(
+            "The remembered relay address `{addr}` is not an address and port."
+        )),
+        Some(addr) => match plan {
+            // Configured wrongly in a way that is not the address: no
+            // credential, say. Ticking a box that cannot work is worse than a
+            // greyed one with the reason next to it.
+            crate::relay_dial::RelayPlan::Unusable { why, .. } => {
+                Some(format!("This host cannot use a relay right now: {why}"))
+            }
+            // The environment is pointing this run somewhere else. The setting
+            // still applies — it is about the REMEMBERED relay — so it is not
+            // blocked, and the note below the box says which is which.
+            _ => {
+                let _ = addr;
+                None
+            }
+        },
+    }
+}
+
+/// Where the Corresponding Source is published.
+///
+/// AGPL-3.0 §13 — the clause that distinguishes AGPL from GPL — requires a
+/// modified version to "prominently offer all users interacting with it
+/// remotely through a computer network" an opportunity to receive the source.
+/// RemoteDexter is AGPL-3.0-only, and a phone driving this host over a network
+/// is exactly the remote user the clause is about. The notice is surfaced here
+/// rather than left implicit: a licence promising source a user cannot find is
+/// worth nothing, and every downstream fork is bound by §13.
+///
+/// That the operator and the phone user are usually the same person does not
+/// discharge it: the obligation is about what the software offers, not about
+/// who happens to be holding the phone.
+///
+/// The source lives in the public repository. Each release attaches the
+/// allowlist export of its exact commit (`scripts/make-public-export.sh`), with
+/// its digest, beside the binaries it corresponds to -- so a user holding any
+/// release can fetch the source that built it.
+pub const SOURCE_URL: &str = "https://github.com/BaxtersLab/RemoteDexter";
+
+/// The one-line notice shown wherever a user can see it.
+pub const LICENCE_NOTICE: &str = "RemoteDexter — AGPL-3.0-only. Source:";
+
+/// The application ID the host's window carries, and the packaged desktop
+/// entry's file name (`baxters-remotedexter.desktop`).
+///
+/// GNOME on Wayland matches a window to its launcher by app_id. eframe sets
+/// none unless asked, so the dock could not tell that the host's window belongs
+/// to RemoteDexter's desktop entry: a generic icon, and a window detached from
+/// the launcher that opened it -- the defect A1 s5 exists to stop. The entry
+/// also declares StartupWMClass and Icon by this name, and
+/// `the_window_app_id_matches_the_desktop_entry` keeps all of them in step.
+pub const APP_ID: &str = "baxters-remotedexter";
+
+/// The host window's options, in one place so the identity it carries can be
+/// tested without opening a window.
+fn native_options() -> eframe::NativeOptions {
+    eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([520.0, 640.0])
+            .with_min_inner_size([440.0, 520.0])
+            .with_title("RemoteDexter — host")
+            .with_app_id(APP_ID),
+        ..Default::default()
+    }
+}
+
+/// The smallest scale a camera has actually paired from on this project's
+/// hardware. Windows round 9 paired at 5 and measured 4.22 px/module surviving
+/// a bad webcam; round 10 measured 4 px/module maximized, and the operator
+/// declined to even attempt 1. Below this the code is a picture of a credential
+/// rather than a usable one.
+const MIN_SCANNABLE_PX_PER_MODULE: f32 = 4.0;
+
+/// Whether a rendered code is big enough to be worth pointing a camera at.
+///
+/// WHY THIS IS SEPARATE FROM `qr_display_side`
+///
+/// Windows round 10 named the gap exactly: the visibility tests "prove
+/// visibility but do not protect a minimum scannable scale". Making the code
+/// FIT is not the same as making it USABLE, and I had tested only the first.
+///
+/// Three versions of this feature, each fixing the last and breaking something
+/// new: 220 px fixed (2.27 px/module, ragged); width-sized at 600 (5 px/module
+/// but 215 of 485 px visible, clipped below the fold); viewport-fitted (fully
+/// visible, and 1 px/module at the default window -- a 97 px thumbnail the
+/// operator refused to scan).
+///
+/// So when the room genuinely is not there, SAY SO. A silent thumbnail looks
+/// like a working feature and is not one.
+fn qr_is_scannable(side: f32, qr_size: usize) -> bool {
+    let modules = qr_size.max(1) as f32;
+    side / modules >= MIN_SCANNABLE_PX_PER_MODULE
+}
+
 /// How many screen pixels wide to draw the pairing QR.
 ///
 /// Windows round 8 measured the rendered code at 206x208 px and counted "~69
@@ -1124,55 +1748,6 @@ pub(crate) fn admin_sections_visible(_invite_displayed: bool) -> bool {
 /// `height` is the room left in the visible viewport, not in the scrollable
 /// content: inside a `ScrollArea` those differ, and the scrollable one is the
 /// number that hides the bug.
-/// Where the Corresponding Source is published.
-///
-/// AGPL-3.0 §13 — the clause that distinguishes AGPL from GPL — requires a
-/// modified version to "prominently offer all users interacting with it
-/// remotely through a computer network" an opportunity to receive the source.
-/// RemoteDexter is AGPL-3.0-only, and a phone driving this host over a network
-/// is exactly the remote user the clause is about. The notice is surfaced here
-/// rather than left implicit: a licence promising source a user cannot find is
-/// worth nothing, and every downstream fork is bound by §13.
-///
-/// That the operator and the phone user are usually the same person does not
-/// discharge it: the obligation is about what the software offers, not about
-/// who happens to be holding the phone.
-///
-/// Published 2026-09-04. The archive served there is byte-identical to
-/// `git archive` output for its commit, and the page carries the digest.
-pub const SOURCE_URL: &str = "https://baxters.vip/remotedexter/";
-
-/// The one-line notice shown wherever a user can see it.
-pub const LICENCE_NOTICE: &str = "RemoteDexter — AGPL-3.0-only. Source:";
-
-/// The smallest scale a camera has actually paired from on this project's
-/// hardware. Windows round 9 paired at 5 and measured 4.22 px/module surviving
-/// a bad webcam; round 10 measured 4 px/module maximized, and the operator
-/// declined to even attempt 1. Below this the code is a picture of a credential
-/// rather than a usable one.
-const MIN_SCANNABLE_PX_PER_MODULE: f32 = 4.0;
-
-/// Whether a rendered code is big enough to be worth pointing a camera at.
-///
-/// WHY THIS IS SEPARATE FROM `qr_display_side`
-///
-/// Windows round 10 named the gap exactly: the visibility tests "prove
-/// visibility but do not protect a minimum scannable scale". Making the code
-/// FIT is not the same as making it USABLE, and I had tested only the first.
-///
-/// Three versions of this feature, each fixing the last and breaking something
-/// new: 220 px fixed (2.27 px/module, ragged); width-sized at 600 (5 px/module
-/// but 215 of 485 px visible, clipped below the fold); viewport-fitted (fully
-/// visible, and 1 px/module at the default window -- a 97 px thumbnail the
-/// operator refused to scan).
-///
-/// So when the room genuinely is not there, SAY SO. A silent thumbnail looks
-/// like a working feature and is not one.
-fn qr_is_scannable(side: f32, qr_size: usize) -> bool {
-    let modules = qr_size.max(1) as f32;
-    side / modules >= MIN_SCANNABLE_PX_PER_MODULE
-}
-
 fn qr_display_side(qr_size: usize, available_width: f32, available_height: f32) -> f32 {
     // 97 modules is what a real invite encodes to. 440 px would give 4
     // px/module; 600 gives 6, which is where an ordinary camera stops
@@ -1197,6 +1772,20 @@ fn qr_display_side(qr_size: usize, available_width: f32, available_height: f32) 
     scale * modules
 }
 
+/// Whether the cached QR image still depicts the current invitation.
+///
+/// Keyed on the invitation's fingerprint, **not** its pixel size. Two different
+/// invitations are almost always the same number of modules, so a size
+/// comparison cannot tell them apart: minting a fresh code leaves the cache
+/// looking valid and the panel goes on showing the previous, expiring QR while
+/// the log correctly reports a new token. Observed on Windows on 2026-08-26 —
+/// repeated "Create pairing QR" produced codes the phone rejected as expired
+/// until the host was stopped and started, which cleared the cache by dropping
+/// the invite.
+///
+/// The fingerprint is the short non-secret handle `InviteView` already exposes
+/// for log correlation; the modules themselves are the token and never leave
+/// the widget.
 fn qr_cache_is_stale(cached: Option<(&str, usize)>, current: (&str, usize)) -> bool {
     match cached {
         Some((cached_fingerprint, cached_size)) => {
@@ -1224,6 +1813,417 @@ mod tests {
         let mut r = record(key, created);
         r.revoked_at = Some(created + 1);
         r
+    }
+
+    /// **The terminal must say whether the relay worked.**
+    ///
+    /// As P3 shipped it did not: success was silent, a refusal reached only the
+    /// window, and a retry was the single thing that printed — so the outcome
+    /// needing no attention was the only one that spoke. The operator watched a
+    /// live start and could not tell from stderr whether it had connected.
+    #[test]
+    fn the_terminal_hears_the_relay_connect_and_hears_it_refuse() {
+        let relay: SocketAddr = "203.0.113.9:9443".parse().unwrap();
+        let connected = terminal_note(&HostEvent::StateChanged(HostState::Pairable {
+            reach: Reach::ViaRelay {
+                relay,
+                session: "AAAAAAAAAAAAAAAAAAAAAA".into(),
+            },
+        }))
+        .expect("a host that reached its relay said nothing to the terminal");
+        assert!(connected.contains("203.0.113.9:9443"), "{connected}");
+        assert!(
+            connected.contains("nothing is listening"),
+            "the line must still say a dialled-out host binds no port: {connected}"
+        );
+
+        let refused = terminal_note(&HostEvent::Fault {
+            message: "the relay refused this host: not enrolled".into(),
+        })
+        .expect("a refused relay said nothing to the terminal");
+        assert!(refused.contains("not enrolled"), "{refused}");
+
+        let retrying = terminal_note(&HostEvent::RelayRetrying {
+            attempt: 1,
+            in_seconds: 1,
+            why: "could not reach the relay".into(),
+        })
+        .expect("a retry said nothing to the terminal");
+        assert!(retrying.contains("trying again"), "{retrying}");
+    }
+
+    /// **A host serving both routes says both**, and still says it is listening:
+    /// the operator's question is what of theirs is exposed, and the answer is
+    /// a port AND a relay.
+    #[test]
+    fn a_host_serving_both_routes_says_it_is_listening_and_relayed() {
+        let line = reach_detail(&Reach::Both {
+            bound: "192.168.1.20:8082".parse().unwrap(),
+            relay: "203.0.113.9:9443".parse().unwrap(),
+            session: "AAAAAAAAAAAAAAAAAAAAAA".into(),
+        });
+        assert!(line.contains("Listening on 192.168.1.20:8082"), "{line}");
+        assert!(line.contains("relay 203.0.113.9:9443"), "{line}");
+        assert!(
+            !line.contains("nothing is listening"),
+            "a host with a listener must not say nothing is listening: {line}"
+        );
+        assert!(
+            !line.contains("AAAAAAAAAAAAAAAAAAAAAA"),
+            "the session id reached the status line"
+        );
+    }
+
+    /// **A withdrawn code leaves the screen**, as a stopped host's always did.
+    /// A host serving both routes keeps running when one route goes, so
+    /// `Stopped` alone no longer covers it.
+    #[test]
+    fn a_withdrawn_code_or_a_stopped_host_takes_the_code_off_screen() {
+        assert!(!invite_outlives(&HostEvent::InviteWithdrawn));
+        assert!(!invite_outlives(&HostEvent::StateChanged(
+            HostState::Stopped
+        )));
+        let relay: SocketAddr = "203.0.113.9:9443".parse().unwrap();
+        for kept in [
+            HostEvent::StateChanged(HostState::Pairable {
+                reach: Reach::ViaRelay {
+                    relay,
+                    session: "AAAAAAAAAAAAAAAAAAAAAA".into(),
+                },
+            }),
+            HostEvent::PeerConnected {
+                peer: "phone".into(),
+                count: 1,
+            },
+            HostEvent::Fault {
+                message: "the relay connection closed — reconnecting".into(),
+            },
+        ] {
+            assert!(invite_outlives(&kept), "{kept:?} took the code off screen");
+        }
+    }
+
+    /// **Each route has its own way on and off**, and a listener is still only
+    /// ever opened by a click: Start adds one beside a relay, Connect via relay
+    /// adds the relay beside a listener, Stop listening closes only the port —
+    /// and only where that leaves the host serving — and Stop host ends it all.
+    #[test]
+    fn each_route_can_be_added_and_closed_on_its_own() {
+        let relay: SocketAddr = "203.0.113.9:9443".parse().unwrap();
+        let bound: SocketAddr = "192.168.1.20:8082".parse().unwrap();
+        let session = "AAAAAAAAAAAAAAAAAAAAAA".to_string();
+
+        assert_eq!(
+            controls(&HostState::Stopped, false),
+            Controls {
+                start: Some("Start host"),
+                stop_listening: false,
+                dial: Some("Connect via relay"),
+                stop: false,
+            }
+        );
+
+        let relay_only = controls(
+            &HostState::Pairable {
+                reach: Reach::ViaRelay {
+                    relay,
+                    session: session.clone(),
+                },
+            },
+            false,
+        );
+        assert_eq!(relay_only.start, Some("Also listen on this interface"));
+        assert_eq!(
+            relay_only.dial, None,
+            "a second relay connection was offered"
+        );
+        assert!(!relay_only.stop_listening, "nothing is listening");
+        assert!(relay_only.stop);
+
+        let lan_only = controls(
+            &HostState::Pairable {
+                reach: Reach::Bound(bound),
+            },
+            false,
+        );
+        assert_eq!(
+            lan_only.start, None,
+            "moving interface is Stop listening, then Start"
+        );
+        assert_eq!(lan_only.dial, Some("Also connect via relay"));
+        assert!(
+            !lan_only.stop_listening,
+            "Stop listening on the only route would be Stop host under another name"
+        );
+
+        let both = HostState::Connected {
+            reach: Reach::Both {
+                bound,
+                relay,
+                session,
+            },
+            peers: 1,
+        };
+        let serving_both = controls(&both, false);
+        assert_eq!(serving_both.start, None);
+        assert_eq!(serving_both.dial, None);
+        assert!(serving_both.stop_listening);
+        assert!(serving_both.stop);
+
+        let dialling = controls(&HostState::Starting, false);
+        assert_eq!(
+            dialling.start,
+            Some("Start host"),
+            "a listener may be started while the relay is still dialling"
+        );
+        assert_eq!(dialling.dial, None, "a dial is already under way");
+        assert!(dialling.stop, "a dial in progress must be stoppable");
+
+        let nothing = Controls {
+            start: None,
+            stop_listening: false,
+            dial: None,
+            stop: false,
+        };
+        assert_eq!(controls(&HostState::Stopping, false), nothing);
+        assert_eq!(controls(&both, true), nothing, "the window is closing");
+    }
+
+    /// The code-format setting says what turning it on costs, and what off means.
+    #[test]
+    fn the_code_format_setting_says_what_it_costs() {
+        assert!(dual_route_note(true).contains("from this release"));
+        assert!(dual_route_note(true).contains("whichever answers first"));
+        assert!(dual_route_note(false).contains("Every RemoteDexter app"));
+    }
+
+    /// **Reconnecting and refused never read alike** — found 2026-09-17, when a
+    /// host lost its relay and the console could not say whether it would come
+    /// back or needed a human. One line, five answers.
+    #[test]
+    fn the_relay_line_tells_connected_reconnecting_refused_and_not_connected_apart() {
+        let relay: SocketAddr = "203.0.113.9:9443".parse().unwrap();
+        let session = "AAAAAAAAAAAAAAAAAAAAAA".to_string();
+        let via = HostState::Pairable {
+            reach: Reach::ViaRelay {
+                relay,
+                session: session.clone(),
+            },
+        };
+        let lan = HostState::Pairable {
+            reach: Reach::Bound("192.168.1.20:8082".parse().unwrap()),
+        };
+        let retry = relay_retry_line(2, 1, "the relay connection closed");
+
+        assert_eq!(
+            relay_line(false, &via, None, None),
+            None,
+            "no relay, no relay line"
+        );
+        assert_eq!(
+            relay_line(true, &via, Some(&retry), Some("stale")),
+            Some(RelayLine::Connected(relay)),
+            "a connected relay outranks anything left over"
+        );
+        assert_eq!(
+            relay_line(true, &HostState::Starting, None, None),
+            Some(RelayLine::Connecting)
+        );
+        assert_eq!(
+            relay_line(true, &HostState::Starting, Some(&retry), None),
+            Some(RelayLine::Reconnecting(retry.clone()))
+        );
+        assert_eq!(
+            relay_line(true, &lan, Some(&retry), None),
+            Some(RelayLine::Reconnecting(retry.clone())),
+            "a host still listening while it re-dials its relay"
+        );
+        let refused = relay_line(
+            true,
+            &HostState::Error {
+                message: "x".into(),
+            },
+            None,
+            Some("the relay refused this host: not enrolled"),
+        )
+        .unwrap();
+        assert_eq!(
+            refused,
+            RelayLine::Refused("the relay refused this host: not enrolled".into())
+        );
+        assert_eq!(
+            relay_line(true, &HostState::Stopped, None, None),
+            Some(RelayLine::NotConnected)
+        );
+
+        let refused_text = refused.text();
+        let retry_text = RelayLine::Reconnecting(retry).text();
+        assert!(refused_text.contains("not enrolled"), "{refused_text}");
+        assert!(
+            refused_text.contains("will not be retried"),
+            "{refused_text}"
+        );
+        assert!(retry_text.contains("trying again"), "{retry_text}");
+        assert!(
+            !refused_text.contains("trying again") && !retry_text.contains("refused"),
+            "the two lines say the same kind of thing: {refused_text} / {retry_text}"
+        );
+        assert!(
+            !RelayLine::Connected(relay).text().contains(&session),
+            "the session id reached the status line"
+        );
+    }
+
+    /// A retry line lasts exactly as long as a dial is under way: through a
+    /// first connect, and while a listening host re-dials a relay it lost.
+    #[test]
+    fn a_retry_line_lasts_while_the_relay_is_being_dialled_and_no_longer() {
+        let relay: SocketAddr = "203.0.113.9:9443".parse().unwrap();
+        let bound: SocketAddr = "192.168.1.20:8082".parse().unwrap();
+        let session = "AAAAAAAAAAAAAAAAAAAAAA".to_string();
+        assert!(retry_line_is_current(&HostState::Starting));
+        assert!(retry_line_is_current(&HostState::Pairable {
+            reach: Reach::Bound(bound)
+        }));
+        assert!(retry_line_is_current(&HostState::Connected {
+            reach: Reach::Bound(bound),
+            peers: 1
+        }));
+        for over in [
+            HostState::Pairable {
+                reach: Reach::ViaRelay {
+                    relay,
+                    session: session.clone(),
+                },
+            },
+            HostState::Connected {
+                reach: Reach::Both {
+                    bound,
+                    relay,
+                    session,
+                },
+                peers: 1,
+            },
+            HostState::Stopped,
+            HostState::Stopping,
+            HostState::Error {
+                message: "x".into(),
+            },
+        ] {
+            assert!(
+                !retry_line_is_current(&over),
+                "{over:?} kept a stale retry line"
+            );
+        }
+    }
+
+    /// The terminal hears a refusal as a refusal, not as one more retry.
+    #[test]
+    fn the_terminal_hears_a_refusal_as_a_refusal() {
+        let line = terminal_note(&HostEvent::RelayRefused {
+            why: "the relay refused this host: not enrolled".into(),
+        })
+        .expect("a refusal said nothing to the terminal");
+        assert!(line.contains("not enrolled"), "{line}");
+        assert!(line.contains("will not be retried"), "{line}");
+    }
+
+    /// Ordinary session traffic stays out of the terminal. A line per peer
+    /// would bury the lines that matter under the ones that do not.
+    #[test]
+    fn the_terminal_is_not_told_about_every_peer() {
+        for quiet in [
+            HostEvent::PeerConnected {
+                peer: "phone".into(),
+                count: 1,
+            },
+            HostEvent::PeerDisconnected {
+                peer: "phone".into(),
+                count: 0,
+            },
+            HostEvent::StateChanged(HostState::Starting),
+            HostEvent::StateChanged(HostState::Stopped),
+        ] {
+            assert_eq!(
+                terminal_note(&quiet),
+                None,
+                "the terminal was told about {quiet:?}"
+            );
+        }
+    }
+
+    /// **A retry says the host is still trying.**
+    ///
+    /// The relay being briefly unreachable is an ordinary event on a laptop,
+    /// and the line the operator reads must not sound like a failure they have
+    /// to act on — or they learn to ignore the lines that are.
+    #[test]
+    fn a_relay_retry_says_what_is_wrong_and_that_it_is_still_trying() {
+        let line = relay_retry_line(1, 1, "could not reach the relay: connection refused");
+        assert!(line.contains("trying again in 1 second"), "{line}");
+        assert!(line.contains("connection refused"), "{line}");
+        assert!(
+            !line.to_lowercase().contains("failed"),
+            "a retry in progress was described as a failure: {line}"
+        );
+        assert!(
+            relay_retry_line(4, 8, "x").contains("trying again in 8 seconds"),
+            "the plural second is wrong"
+        );
+        assert!(
+            relay_retry_line(1, 0, "x").contains("trying again now"),
+            "a zero wait was rendered as `in 0 seconds`"
+        );
+    }
+
+    /// **A greyed-out checkbox always says why.**
+    ///
+    /// Without the reason, the only way for the operator to find out why they
+    /// cannot tick it is to experiment on a live host.
+    #[test]
+    fn connect_on_start_explains_why_it_cannot_be_ticked() {
+        use crate::relay_dial::{Origin, RelayPlan};
+        let none = crate::settings::RelaySettings::default();
+        let blocked = dial_on_start_blocked(&none, &RelayPlan::Unset)
+            .expect("connect-on-start was offered with no relay remembered");
+        assert!(blocked.contains("Remember a relay address"), "{blocked}");
+
+        let stored = crate::settings::RelaySettings {
+            address: Some("203.0.113.9:9443".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            dial_on_start_blocked(
+                &stored,
+                &RelayPlan::Dial {
+                    relay: "203.0.113.9:9443".parse().unwrap(),
+                    origin: Origin::Stored
+                }
+            ),
+            None,
+            "a remembered, usable relay did not allow connect-on-start"
+        );
+
+        // A relay this run cannot use: the box would tick and do nothing.
+        let unusable = dial_on_start_blocked(
+            &stored,
+            &RelayPlan::Unusable {
+                origin: Origin::Stored,
+                why: "there is no signing identity".to_string(),
+            },
+        )
+        .expect("connect-on-start was offered for a relay this host cannot use");
+        assert!(unusable.contains("signing identity"), "{unusable}");
+
+        // A remembered address that is not an address at all — hand-edited into
+        // the file, which is a thing an owner is invited to do.
+        let bad = crate::settings::RelaySettings {
+            address: Some("relay.example.com:9443".to_string()),
+            ..Default::default()
+        };
+        let named = dial_on_start_blocked(&bad, &RelayPlan::Unset)
+            .expect("connect-on-start was offered for an address that is not one");
+        assert!(named.contains("relay.example.com:9443"), "{named}");
     }
 
     /// The instrument is absent unless it is asked for.
@@ -1598,6 +2598,60 @@ mod tests {
             layout.contains("txtLicenceSource"),
             "the notice string exists but the settings screen never shows it — \
              an offer nobody can read is not an offer"
+        );
+    }
+
+    /// The window, the desktop entry the package installs, and the icon it
+    /// ships must all answer to one name, or GNOME shows the host as a generic
+    /// window detached from its launcher. Checked against the files that ship,
+    /// not against a copy of them.
+    #[test]
+    fn the_window_app_id_matches_the_desktop_entry() {
+        assert_eq!(
+            native_options().viewport.app_id.as_deref(),
+            Some(APP_ID),
+            "the host window does not carry the app_id its desktop entry is named for"
+        );
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let desktop_src = root.join(format!("packaging/linux/{APP_ID}.desktop"));
+        let desktop = std::fs::read_to_string(&desktop_src).unwrap_or_else(|e| {
+            panic!(
+                "no desktop entry named for the app_id at {}: {e}",
+                desktop_src.display()
+            )
+        });
+        let field = |key: &str| {
+            desktop
+                .lines()
+                .find_map(|l| l.strip_prefix(key))
+                .unwrap_or_else(|| panic!("the desktop entry has no {key}"))
+                .trim()
+                .to_string()
+        };
+        assert_eq!(
+            field("StartupWMClass="),
+            APP_ID,
+            "StartupWMClass must be the app_id"
+        );
+        assert_eq!(
+            field("Icon="),
+            APP_ID,
+            "the icon must be the one the package ships"
+        );
+
+        // GNOME matches app_id to the INSTALLED desktop file's name, so the
+        // package must install the entry under exactly that name.
+        let build_deb = std::fs::read_to_string(root.join("scripts/build-deb.sh")).unwrap();
+        assert!(
+            build_deb.contains(&format!(
+                "\"$PKGDIR/usr/share/applications/{APP_ID}.desktop\""
+            )),
+            "scripts/build-deb.sh does not install the desktop entry as {APP_ID}.desktop"
+        );
+        assert!(
+            build_deb.contains(&format!("apps/{APP_ID}.png")),
+            "scripts/build-deb.sh does not install an icon named {APP_ID}"
         );
     }
 

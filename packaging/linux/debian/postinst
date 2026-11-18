@@ -15,7 +15,7 @@
 #   * enable, start or create a systemd unit
 #
 # The packaged rule ships as inert data at
-# /usr/share/remotedexter/70-remotedexter-uinput.rules and stays there.
+# /opt/baxters/remotedexter/70-remotedexter-uinput.rules and stays there.
 
 set -e
 

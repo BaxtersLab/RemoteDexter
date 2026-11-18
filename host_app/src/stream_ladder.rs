@@ -11,12 +11,14 @@
 //! so no new instrumentation is needed.
 //!
 //! **Known limit, stated rather than hidden:** this reads *our* queue. The
-//! kernel socket buffer sits underneath it and can hold megabytes while our
-//! queue looks healthy, so the signal under-reads congestion. The accurate
-//! reading is the socket's own `notsent`/`cwnd` via `TCP_INFO`, which is
-//! Linux-specific and was deliberately left out of this change. This ladder is
-//! a floor under a link that is already collapsing, not a congestion
-//! controller.
+//! kernel socket buffer sits underneath it and could hold megabytes while our
+//! queue looked healthy — measured at 3 MB unsent on a real phone session,
+//! 2026-09-13. Since then `session_writer` bounds that buffer on Linux with
+//! `TCP_NOTSENT_LOWAT` and lets only a couple of chunks wait for the socket, so
+//! a slow link now backs up into the queue this ladder reads. On other
+//! platforms the kernel buffer is still unbounded and the signal still
+//! under-reads. This ladder is a floor under a link that is already
+//! collapsing, not a congestion controller.
 //!
 //! ## Why a ladder and not a dial
 //!
@@ -42,34 +44,81 @@ pub struct Rung {
     pub frame_interval_ms: u64,
     /// JPEG quality ceiling for this rung.
     pub quality: u8,
+    /// Percent of each screen dimension to send (100 = native resolution).
+    /// Below 100 the host downscales the captured frame before encoding, so the
+    /// pixel count — and the JPEG cost — falls as the square of this. It is the
+    /// knob BELOW quality: on a link too slow for full-resolution frames even at
+    /// q50/3 fps (a ~1.8 Mbit/s uplink wants ~4.7 Mbit/s there, so it drops two
+    /// frames of three), fewer pixels is what keeps a steady 3 fps. The phone
+    /// scales the smaller keyframe back to its surface. Downscaling is enabled
+    /// only when the client negotiates normalized_v1 input coordinates.
+    pub scale_pct: u16,
 }
 
-/// The ladder. Roughly geometric in bitrate: about 9x from top to bottom.
-pub const RUNGS: [Rung; 6] = [
+/// The ladder. Roughly geometric in bitrate. The top six vary frame rate and
+/// quality at native resolution; below them the floor downscales, for a link
+/// too slow for full-resolution frames even at q50/3 fps. Measured on a
+/// representative desktop frame tiled to 1920x1080 (full-res q50 ≈ 4.7 Mbit/s
+/// at 3 fps), the downscaled rungs are ≈ 2.4 / 1.9 / 1.0 / 0.7 / 0.4 Mbit/s.
+pub const RUNGS: [Rung; 11] = [
     Rung {
         frame_interval_ms: 50,
         quality: 75,
+        scale_pct: 100,
     }, // 20 fps — the old fixed point
     Rung {
         frame_interval_ms: 66,
         quality: 70,
+        scale_pct: 100,
     }, // ~15 fps
     Rung {
         frame_interval_ms: 100,
         quality: 65,
+        scale_pct: 100,
     }, // 10 fps
     Rung {
         frame_interval_ms: 125,
         quality: 60,
+        scale_pct: 100,
     }, // 8 fps
     Rung {
         frame_interval_ms: 200,
         quality: 55,
+        scale_pct: 100,
     }, // 5 fps
     Rung {
         frame_interval_ms: 333,
         quality: 50,
-    }, // ~3 fps — the floor
+        scale_pct: 100,
+    }, // ~3 fps — the full-resolution floor
+    // Below here the link is too slow for full-resolution frames even at q50/
+    // 3 fps: send fewer pixels rather than drop two frames of three. Scales are
+    // the measured points in `module11::scale::measure_rung_bitrates`.
+    Rung {
+        frame_interval_ms: 333,
+        quality: 50,
+        scale_pct: 75,
+    }, // ~2.4 Mbit/s
+    Rung {
+        frame_interval_ms: 333,
+        quality: 50,
+        scale_pct: 67,
+    }, // ~1.9 Mbit/s
+    Rung {
+        frame_interval_ms: 333,
+        quality: 50,
+        scale_pct: 50,
+    }, // ~1.0 Mbit/s — fits a ~1.8 Mbit/s uplink with headroom
+    Rung {
+        frame_interval_ms: 333,
+        quality: 45,
+        scale_pct: 40,
+    }, // ~0.7 Mbit/s
+    Rung {
+        frame_interval_ms: 333,
+        quality: 40,
+        scale_pct: 33,
+    }, // ~0.4 Mbit/s — the floor
 ];
 
 /// Decisions per evaluation window.
@@ -134,11 +183,18 @@ pub fn on_window(state: State, dropped: u32, sent: u32) -> State {
 mod tests {
     use super::*;
 
-    /// A structural invariant: the ladder must actually descend in bitrate.
-    /// Guards against a future edit that reorders a rung and silently makes
-    /// "backing off" cost more bandwidth than it saves.
+    /// A structural invariant: the ladder must actually descend. Each knob is
+    /// monotonic in the cheaper direction (interval never shrinks, quality and
+    /// scale never rise going down), and — the property that matters — the
+    /// estimated bytes per second strictly fall, so no rung costs as much as or
+    /// more than the one above it. The estimate is pixels (scale squared) times
+    /// quality over the frame interval; the REAL bytes are measured separately
+    /// (`module11::scale::measure_rung_bitrates`).
     #[test]
     fn every_rung_is_cheaper_than_the_one_above_it() {
+        fn est_cost(r: Rung) -> f64 {
+            (r.scale_pct as f64).powi(2) * r.quality as f64 / r.frame_interval_ms as f64
+        }
         for pair in RUNGS.windows(2) {
             let (a, b) = (pair[0], pair[1]);
             assert!(
@@ -150,8 +206,41 @@ mod tests {
                 "quality must not rise going down the ladder: {a:?} -> {b:?}"
             );
             assert!(
-                b.frame_interval_ms > a.frame_interval_ms || b.quality < a.quality,
-                "a rung that costs the same as the one above it is not a rung: {a:?} -> {b:?}"
+                b.scale_pct <= a.scale_pct,
+                "scale must not rise going down the ladder: {a:?} -> {b:?}"
+            );
+            assert!(
+                est_cost(b) < est_cost(a),
+                "a rung that costs the same as or more than the one above it is not a rung: {a:?} -> {b:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_floor_downscales() {
+        // The whole point of the lower rung: the floor sends fewer pixels than
+        // the screen, for a link too slow for full-resolution frames even at
+        // the quality/interval floor.
+        let floor = RUNGS[RUNGS.len() - 1];
+        assert!(
+            floor.scale_pct < 100,
+            "the floor must downscale, got {}%",
+            floor.scale_pct
+        );
+    }
+
+    #[test]
+    fn full_resolution_rungs_precede_downscaled_ones() {
+        // A healthy link keeps native pixels; once the ladder starts
+        // downscaling it never returns to full resolution lower down.
+        if let Some(i) = RUNGS.iter().position(|r| r.scale_pct < 100) {
+            assert!(
+                RUNGS[..i].iter().all(|r| r.scale_pct == 100),
+                "a downscaled rung appears above a full-resolution one"
+            );
+            assert!(
+                RUNGS[i..].iter().all(|r| r.scale_pct < 100),
+                "a full-resolution rung appears below a downscaled one"
             );
         }
     }

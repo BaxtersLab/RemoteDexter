@@ -108,12 +108,16 @@ impl HostBackend for Probe {
         let token_fingerprint = match reach {
             host_controller::Reach::Bound(bound) => format!("{:04x}", bound.port()),
             host_controller::Reach::ViaRelay { session, .. } => format!("relay:{session}"),
+            host_controller::Reach::Both { bound, session, .. } => {
+                format!("both:{:04x}:{session}", bound.port())
+            }
         };
         Ok(host_controller::state::InviteView {
             qr_size: 25,
             qr_modules: vec![false; 25 * 25],
             token_fingerprint,
             expires_at: now + 60,
+            carries: "the probe's route".into(),
         })
     }
 
@@ -325,7 +329,7 @@ fn a_second_start_is_refused_rather_than_rebinding() {
     let deadline = std::time::Instant::now() + T;
     while std::time::Instant::now() < deadline {
         match h.wait_for_event(Duration::from_millis(200)) {
-            Some(HostEvent::Fault { message }) if message.contains("already running") => {
+            Some(HostEvent::Fault { message }) if message.contains("already listening") => {
                 saw_refusal = true;
                 break;
             }
@@ -1103,11 +1107,127 @@ impl host_controller::DialOut for QuietDialOut {
     }
 }
 
-struct RefusingDialOut;
+/// A relay that answers and says no. Counts the attempts, because "it was
+/// refused" is not the property that matters — how many times this host dialled
+/// after being told no is.
+#[derive(Clone, Default)]
+struct RefusingDialOut {
+    attempts: Arc<AtomicUsize>,
+}
 
 impl host_controller::DialOut for RefusingDialOut {
     fn connect(&mut self) -> host_controller::source::DialFuture<'_> {
-        Box::pin(async { Err("could not reach the relay: connection refused".to_string()) })
+        let attempts = self.attempts.clone();
+        Box::pin(async move {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Err(host_controller::DialFailure::refused(
+                "the relay refused this host: not enrolled",
+            ))
+        })
+    }
+}
+
+/// A relay that cannot be reached for the first `fail_times` attempts, and then
+/// answers — a laptop that woke up before its Wi-Fi did.
+struct FlakyDialOut {
+    relay: SocketAddr,
+    attempts: Arc<AtomicUsize>,
+    fail_times: usize,
+}
+
+impl host_controller::DialOut for FlakyDialOut {
+    fn connect(&mut self) -> host_controller::source::DialFuture<'_> {
+        let relay = self.relay;
+        let attempts = self.attempts.clone();
+        let fail_times = self.fail_times;
+        Box::pin(async move {
+            if attempts.fetch_add(1, Ordering::SeqCst) < fail_times {
+                return Err(host_controller::DialFailure::unreachable(
+                    "could not reach the relay: network unreachable",
+                ));
+            }
+            Ok(Box::new(QuietSource { relay }) as Box<dyn host_controller::PeerSource>)
+        })
+    }
+}
+
+/// A dial that never completes — the relay's address routes nowhere and the
+/// connect sits in SYN-SENT. The operator's Stop has to work anyway.
+struct HangingDialOut;
+
+impl host_controller::DialOut for HangingDialOut {
+    fn connect(&mut self) -> host_controller::source::DialFuture<'_> {
+        Box::pin(async move {
+            std::future::pending::<()>().await;
+            unreachable!()
+        })
+    }
+}
+
+/// A source that records being dropped. Dropping it is what closes the control
+/// connection to the relay, so "was it dropped" is "was the relay's slot freed".
+struct ClosingSource {
+    relay: SocketAddr,
+    dropped: Arc<AtomicUsize>,
+}
+
+impl Drop for ClosingSource {
+    fn drop(&mut self) {
+        self.dropped.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl host_controller::PeerSource for ClosingSource {
+    fn next_peer(&mut self) -> host_controller::source::PeerFuture<'_> {
+        Box::pin(std::future::pending())
+    }
+    fn reach(&self) -> host_controller::Reach {
+        host_controller::Reach::ViaRelay {
+            relay: self.relay,
+            session: "AAAAAAAAAAAAAAAAAAAAAA".into(),
+        }
+    }
+}
+
+/// A relay that takes a moment to answer, and then does.
+struct SlowDialOut {
+    relay: SocketAddr,
+    delay: Duration,
+    dropped: Arc<AtomicUsize>,
+}
+
+impl host_controller::DialOut for SlowDialOut {
+    fn connect(&mut self) -> host_controller::source::DialFuture<'_> {
+        let relay = self.relay;
+        let delay = self.delay;
+        let dropped = self.dropped.clone();
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            Ok(Box::new(ClosingSource { relay, dropped }) as Box<dyn host_controller::PeerSource>)
+        })
+    }
+}
+
+/// Wait for the first `RelayRetrying`, ignoring everything else.
+fn await_retry(
+    h: &mut host_controller::HostHandle,
+    within: Duration,
+) -> Option<(u32, u64, String)> {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        match h.wait_for_event(left) {
+            Some(HostEvent::RelayRetrying {
+                attempt,
+                in_seconds,
+                why,
+            }) => return Some((attempt, in_seconds, why)),
+            Some(_) => continue,
+            None => return None,
+        }
     }
 }
 
@@ -1143,20 +1263,54 @@ fn a_dialled_out_host_is_running_but_never_listening() {
 /// A route that dies is reported. Staying `Pairable` with no way for a client
 /// to arrive is the failure a persistent outbound connection makes possible.
 #[test]
-fn a_dial_out_route_that_dies_becomes_a_visible_error() {
+fn a_relay_route_that_keeps_dying_is_retried_visibly_and_backs_off() {
+    // Changed 2026-09-17. This test used to require an Error state: a relay
+    // route that ended ended the host. That is exactly what left the operator
+    // unreachable for ten hours, so a lost relay is now dialled again. What
+    // must still hold is that the loss is VISIBLE — the host says it lost the
+    // relay and that it is trying again — and that a relay which accepts the
+    // host and drops it at once is not re-dialled in a tight loop.
+    let connects = Arc::new(AtomicUsize::new(0));
     let mut h = host_controller::spawn_with_dial_out(
         Probe::default,
-        DeadDialOut {
+        CountingDeadDialOut {
             relay: sa("203.0.113.9:9443"),
+            connects: connects.clone(),
         },
     );
     h.send(HostCommand::StartViaRelay).unwrap();
-    let ended = h
-        .wait_for_state(T, |s| matches!(s, HostState::Error { .. }))
-        .expect("a host whose route closed kept reporting that it was reachable");
+    let window = Duration::from_millis(3500);
+    let (_, seen) = await_event(&mut h, window, |_| false);
     assert!(
-        !ended.is_running(),
-        "an errored host still claimed to serve"
+        seen.iter()
+            .any(|e| matches!(e, HostEvent::Fault { message } if message.contains("reconnecting"))),
+        "the loss was not reported: {seen:?}"
+    );
+    let delays: Vec<u64> = seen
+        .iter()
+        .filter_map(|e| match e {
+            HostEvent::RelayRetrying { in_seconds, .. } => Some(*in_seconds),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        delays.len() >= 3,
+        "the retries were not announced: {delays:?}"
+    );
+    assert!(
+        delays.windows(2).all(|w| w[0] <= w[1]) && *delays.last().unwrap() >= 2,
+        "a relay that keeps dropping the host did not back off: {delays:?}"
+    );
+    let dialled = connects.load(Ordering::SeqCst);
+    assert!(
+        (3..=5).contains(&dialled),
+        "{dialled} dials in 3.5 s: 0, 1, 2 s apart allows 4 — more is a tight loop"
+    );
+    assert!(
+        !seen
+            .iter()
+            .any(|e| matches!(e, HostEvent::StateChanged(HostState::Error { .. }))),
+        "a lost relay still ended the host: {seen:?}"
     );
     assert!(h.shutdown_and_join(T));
 }
@@ -1164,13 +1318,185 @@ fn a_dial_out_route_that_dies_becomes_a_visible_error() {
 /// A relay that refuses is reported as a fault, and leaves nothing running.
 #[test]
 fn a_relay_that_refuses_leaves_the_host_stopped() {
-    let mut h = host_controller::spawn_with_dial_out(Probe::default, RefusingDialOut);
+    let dial = RefusingDialOut::default();
+    let mut h = host_controller::spawn_with_dial_out(Probe::default, dial.clone());
     h.send(HostCommand::StartViaRelay).unwrap();
     let ended = h
         .wait_for_state(T, |s| matches!(s, HostState::Error { .. }))
         .expect("a refused dial-out produced no error state");
     assert!(!ended.is_listening());
     assert!(!ended.is_running());
+    assert!(h.shutdown_and_join(T));
+}
+
+/// **A relay that answers and says no is dialled exactly once.**
+///
+/// The retry exists for a relay that could not be reached. A credential the
+/// relay has already rejected will be rejected again, so retrying it hammers
+/// the relay — and, worse, each attempt overwrites the reason before the
+/// operator has read why they are not getting in.
+#[test]
+fn a_refused_credential_is_never_dialled_a_second_time() {
+    let dial = RefusingDialOut::default();
+    let mut h = host_controller::spawn_with_dial_out(Probe::default, dial.clone());
+    h.send(HostCommand::StartViaRelay).unwrap();
+    h.wait_for_state(T, |s| matches!(s, HostState::Error { .. }))
+        .expect("a refused dial-out produced no error state");
+    // Well past the first backoff, which is one second.
+    std::thread::sleep(Duration::from_millis(1_500));
+    assert_eq!(
+        dial.attempts.load(Ordering::SeqCst),
+        1,
+        "a relay that refused this host was dialled again"
+    );
+    assert!(h.shutdown_and_join(T));
+}
+
+/// **A relay that is merely unreachable is tried again, and the wait is
+/// announced.**
+///
+/// This is the ordinary case on the operator's machine: the host starts with
+/// `dial_on_start` before the Wi-Fi has associated. Giving up on the first
+/// failure would mean an icon that is permanently "Error" until someone clicks
+/// something, which is exactly what making the relay the default has to avoid.
+#[test]
+fn an_unreachable_relay_is_retried_until_it_answers() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let mut h = host_controller::spawn_with_dial_out(
+        Probe::default,
+        FlakyDialOut {
+            relay: sa("203.0.113.9:9443"),
+            attempts: attempts.clone(),
+            fail_times: 1,
+        },
+    );
+    h.send(HostCommand::StartViaRelay).unwrap();
+
+    let (attempt, in_seconds, why) =
+        await_retry(&mut h, T).expect("an unreachable relay produced no retry announcement");
+    assert_eq!(
+        attempt, 1,
+        "the first failure was not reported as attempt 1"
+    );
+    assert_eq!(
+        in_seconds, 1,
+        "the wait before the second attempt was not the documented one second"
+    );
+    assert!(
+        why.contains("unreachable"),
+        "the retry did not carry why the last attempt failed: {why}"
+    );
+
+    let reached = h
+        .wait_for_state(T, |s| s.is_running())
+        .expect("a relay that came back was never dialled again");
+    assert!(
+        !reached.is_listening(),
+        "the retried route bound a port — a dial-out binds nothing"
+    );
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "the relay was dialled a different number of times than once-failed-then-once-succeeded"
+    );
+    assert!(h.shutdown_and_join(T));
+}
+
+/// **Stop reaches a host that is still connecting.**
+///
+/// A TCP connect to a machine that is not answering takes minutes to fail. The
+/// dial therefore cannot be awaited on the loop that reads commands, or the
+/// console's Stop button does nothing for those minutes and the operator is
+/// left with a window that ignores them.
+#[test]
+fn stop_is_obeyed_while_a_dial_is_still_hanging() {
+    let mut h = host_controller::spawn_with_dial_out(Probe::default, HangingDialOut);
+    h.send(HostCommand::StartViaRelay).unwrap();
+    h.wait_for_state(T, |s| matches!(s, HostState::Starting))
+        .expect("the host never reported that it was starting");
+
+    h.send(HostCommand::Stop).unwrap();
+    let stopped = h
+        .wait_for_state(Duration::from_secs(2), |s| matches!(s, HostState::Stopped))
+        .expect("Stop did not reach a host that was still connecting to the relay");
+    assert!(!stopped.is_running());
+    assert!(h.shutdown_and_join(T));
+}
+
+/// **A relay connection that lands after Stop is closed, not served.**
+///
+/// The dial cannot be un-dialled, so it finishes after the operator has already
+/// stopped the host. If that connection were brought up, the host would start
+/// serving something the operator told it not to; if it were merely forgotten,
+/// the registration would sit on the relay holding a session slot until a
+/// keepalive eventually reaped it.
+#[test]
+fn a_relay_connection_that_arrives_after_a_stop_is_closed() {
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let mut h = host_controller::spawn_with_dial_out(
+        Probe::default,
+        SlowDialOut {
+            relay: sa("203.0.113.9:9443"),
+            delay: Duration::from_millis(300),
+            dropped: dropped.clone(),
+        },
+    );
+    h.send(HostCommand::StartViaRelay).unwrap();
+    h.wait_for_state(T, |s| matches!(s, HostState::Starting))
+        .expect("the host never reported that it was starting");
+    h.send(HostCommand::Stop).unwrap();
+    h.wait_for_state(T, |s| matches!(s, HostState::Stopped))
+        .expect("Stop did not reach a host that was still connecting");
+
+    // The connection is still on its way. Give it well past its own delay.
+    assert!(
+        h.wait_for_state(Duration::from_secs(2), |s| s.is_running())
+            .is_none(),
+        "a host that was stopped began serving a relay connection anyway"
+    );
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        1,
+        "the late relay connection was never closed — the relay would hold the session slot"
+    );
+    assert!(h.shutdown_and_join(T));
+}
+
+/// **Stopping a dial does not cost this host its relay.**
+///
+/// The credential and the relay address live in the dialler, and the dialler is
+/// moved into the attempt. If a stopped attempt destroyed it, every later
+/// `StartViaRelay` would answer "no relay is configured" — which is false, and
+/// sends the operator looking for a setting they never changed.
+#[test]
+fn a_host_can_dial_again_after_stopping_a_dial() {
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let mut h = host_controller::spawn_with_dial_out(
+        Probe::default,
+        SlowDialOut {
+            relay: sa("203.0.113.9:9443"),
+            delay: Duration::from_millis(200),
+            dropped: dropped.clone(),
+        },
+    );
+    h.send(HostCommand::StartViaRelay).unwrap();
+    h.wait_for_state(T, |s| matches!(s, HostState::Starting))
+        .expect("the host never reported that it was starting");
+    h.send(HostCommand::Stop).unwrap();
+    h.wait_for_state(T, |s| matches!(s, HostState::Stopped))
+        .expect("Stop did not reach a host that was still connecting");
+
+    // Let the abandoned attempt finish and hand the dialler back.
+    let deadline = std::time::Instant::now() + T;
+    while dropped.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    h.send(HostCommand::StartViaRelay).unwrap();
+    let reached = h
+        .wait_for_state(T, |s| s.is_running())
+        .expect("a host that had stopped one dial could not start another");
+    assert!(!reached.is_listening());
     assert!(h.shutdown_and_join(T));
 }
 
@@ -1259,5 +1585,848 @@ fn a_bound_host_still_mints_for_the_address_it_is_bound_to() {
         Some(host_controller::Reach::Bound(addr)) => assert_eq!(addr, bound),
         other => panic!("a bound host minted for {other:?}"),
     }
+    assert!(h.shutdown_and_join(T));
+}
+
+/// **Stop closes the control connection of a host that is SERVING.**
+///
+/// Deferred from P3, which proved only the late-arrival case: a connection that
+/// lands after a Stop is closed at once. The ordinary case — running through the
+/// relay, then Stop or a closed window — rode on the same teardown that
+/// `stop_closes_the_port` proves for listeners, with no test of its own. If it
+/// ever stopped holding, the relay would keep the host's session slot until a
+/// keepalive eventually reaped it, and the operator would see a host they had
+/// stopped still listed as reachable.
+#[test]
+fn stop_closes_the_relay_connection_of_a_serving_host() {
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let mut h = host_controller::spawn_with_dial_out(
+        Probe::default,
+        SlowDialOut {
+            relay: sa("203.0.113.9:9443"),
+            delay: Duration::from_millis(0),
+            dropped: dropped.clone(),
+        },
+    );
+    h.send(HostCommand::StartViaRelay).unwrap();
+    h.wait_for_state(T, |s| s.is_running())
+        .expect("the host never reported that it was serving through the relay");
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        0,
+        "the relay connection was closed while the host was still serving"
+    );
+
+    h.send(HostCommand::Stop).unwrap();
+    h.wait_for_state(T, |s| matches!(s, HostState::Stopped))
+        .expect("the host never stopped");
+
+    let deadline = std::time::Instant::now() + T;
+    while dropped.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        1,
+        "Stop left the relay connection open — the relay would hold the session slot"
+    );
+    assert!(h.shutdown_and_join(T));
+}
+
+// ── P5: both routes at once ──────────────────────────────────────────────────
+//
+// The relay connects on start and the LAN listener is added by a click, so a
+// running host can hold both. What must hold: adding a route never restarts
+// capture or input; losing one route keeps the other serving; only the last
+// route ends the host; a listener is never reopened by anything but the
+// operator; and Stop still closes everything.
+
+/// A relay route whose control connection the test can cut, and which hands
+/// out REAL sockets: clients connect to its own loopback "door", and each one
+/// is offered to the host as a relayed peer, labelled the way the real relay
+/// source labels them.
+struct LoopbackRelaySource {
+    relay: SocketAddr,
+    door: tokio::net::TcpListener,
+    cut: Arc<tokio::sync::Notify>,
+    served: usize,
+    dropped: Arc<AtomicUsize>,
+}
+
+impl Drop for LoopbackRelaySource {
+    fn drop(&mut self) {
+        self.dropped.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl host_controller::PeerSource for LoopbackRelaySource {
+    fn next_peer(&mut self) -> host_controller::source::PeerFuture<'_> {
+        Box::pin(async move {
+            tokio::select! {
+                _ = self.cut.notified() => None,
+                accepted = self.door.accept() => {
+                    let (stream, _) = accepted.ok()?;
+                    self.served += 1;
+                    Some((stream, self.relay, format!("via relay {} #{}", self.relay, self.served)))
+                }
+            }
+        })
+    }
+    fn reach(&self) -> host_controller::Reach {
+        host_controller::Reach::ViaRelay {
+            relay: self.relay,
+            session: "AAAAAAAAAAAAAAAAAAAAAA".into(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct LoopbackRelay {
+    relay: SocketAddr,
+    connects: Arc<AtomicUsize>,
+    cut: Arc<tokio::sync::Notify>,
+    door: Arc<std::sync::Mutex<Option<SocketAddr>>>,
+    dropped: Arc<AtomicUsize>,
+}
+
+impl LoopbackRelay {
+    fn new() -> Self {
+        LoopbackRelay {
+            relay: sa("203.0.113.9:9443"),
+            connects: Arc::default(),
+            cut: Arc::new(tokio::sync::Notify::new()),
+            door: Arc::default(),
+            dropped: Arc::default(),
+        }
+    }
+    /// Where a "phone" connects to reach the host through this relay.
+    fn door(&self) -> SocketAddr {
+        self.door
+            .lock()
+            .unwrap()
+            .expect("the relay was never dialled")
+    }
+    /// Cut the host's current connection to the relay.
+    fn cut(&self) {
+        self.cut.notify_one();
+    }
+}
+
+impl host_controller::DialOut for LoopbackRelay {
+    fn connect(&mut self) -> host_controller::source::DialFuture<'_> {
+        let me = self.clone();
+        Box::pin(async move {
+            let door = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .map_err(|e| host_controller::DialFailure::unreachable(e.to_string()))?;
+            *me.door.lock().unwrap() = Some(door.local_addr().unwrap());
+            me.connects.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(LoopbackRelaySource {
+                relay: me.relay,
+                door,
+                cut: me.cut.clone(),
+                served: 0,
+                dropped: me.dropped.clone(),
+            }) as Box<dyn host_controller::PeerSource>)
+        })
+    }
+}
+
+fn serves_both(s: &HostState) -> bool {
+    matches!(s.reach(), Some(host_controller::Reach::Both { .. }))
+}
+
+fn relay_only(s: &HostState) -> bool {
+    matches!(s.reach(), Some(host_controller::Reach::ViaRelay { .. }))
+}
+
+fn lan_only(s: &HostState) -> bool {
+    matches!(s.reach(), Some(host_controller::Reach::Bound(_)))
+}
+
+/// Wait for an event matching `pred`, collecting everything seen on the way.
+fn await_event(
+    h: &mut host_controller::HostHandle,
+    within: Duration,
+    pred: impl Fn(&HostEvent) -> bool,
+) -> (Option<HostEvent>, Vec<HostEvent>) {
+    let deadline = std::time::Instant::now() + within;
+    let mut seen = Vec::new();
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return (None, seen);
+        }
+        match h.wait_for_event(left) {
+            Some(e) if pred(&e) => return (Some(e), seen),
+            Some(e) => seen.push(e),
+            None => return (None, seen),
+        }
+    }
+}
+
+fn await_fault(h: &mut host_controller::HostHandle, containing: &str) -> Vec<HostEvent> {
+    let (hit, seen) = await_event(
+        h,
+        T,
+        |e| matches!(e, HostEvent::Fault { message } if message.contains(containing)),
+    );
+    assert!(
+        hit.is_some(),
+        "no fault containing {containing:?}; saw {seen:?}"
+    );
+    seen
+}
+
+/// A relay host plus a listener, ready to test. Returns the bound address.
+fn serve_both(h: &mut host_controller::HostHandle) -> SocketAddr {
+    h.send(HostCommand::StartViaRelay).unwrap();
+    h.wait_for_state(T, relay_only)
+        .expect("the relay route never came up");
+    h.send(HostCommand::Start {
+        bind: sa("127.0.0.1:0"),
+    })
+    .unwrap();
+    let s = h
+        .wait_for_state(T, serves_both)
+        .expect("the host never served both routes");
+    s.bound().expect("a host serving both routes is listening")
+}
+
+#[test]
+fn a_relay_host_adds_a_listener_without_restarting_capture() {
+    let probe = Probe::default();
+    let mut h = host_controller::spawn_with_dial_out(
+        {
+            let probe = probe.clone();
+            move || probe
+        },
+        LoopbackRelay::new(),
+    );
+    let bound = serve_both(&mut h);
+    assert!(port_open(bound), "the added listener does not accept");
+    assert_eq!(
+        probe.n(&probe.capture_started),
+        1,
+        "capture was started twice"
+    );
+    assert_eq!(probe.n(&probe.input_opened), 1, "input was opened twice");
+    assert_eq!(probe.n(&probe.capture_stopped), 0);
+
+    // A second listener is still refused, and the first is untouched.
+    h.send(HostCommand::Start {
+        bind: sa("127.0.0.1:0"),
+    })
+    .unwrap();
+    await_fault(&mut h, "already listening");
+    assert!(port_open(bound), "a refused Start disturbed the listener");
+    assert!(h.shutdown_and_join(T));
+}
+
+#[test]
+fn a_listening_host_adds_the_relay_and_refuses_a_second_one() {
+    let probe = Probe::default();
+    let relay = LoopbackRelay::new();
+    let mut h = host_controller::spawn_with_dial_out(
+        {
+            let probe = probe.clone();
+            move || probe
+        },
+        relay.clone(),
+    );
+    let bound = start_on_ephemeral(&mut h);
+    h.send(HostCommand::StartViaRelay).unwrap();
+    let s = h
+        .wait_for_state(T, serves_both)
+        .expect("the relay was not added to a listening host");
+    assert_eq!(
+        s.bound(),
+        Some(bound),
+        "adding the relay moved the listener"
+    );
+    assert!(port_open(bound));
+    assert_eq!(
+        probe.n(&probe.capture_started),
+        1,
+        "capture was started twice"
+    );
+
+    h.send(HostCommand::StartViaRelay).unwrap();
+    await_fault(&mut h, "already connected to the relay");
+    assert_eq!(
+        relay.connects.load(Ordering::SeqCst),
+        1,
+        "the relay was dialled twice"
+    );
+    assert!(h.shutdown_and_join(T));
+}
+
+/// **A relay that drops does not take the LAN route with it**, and is dialled
+/// again. The outstanding code is withdrawn, because it may name the route
+/// that went.
+#[test]
+fn losing_the_relay_keeps_the_listener_and_dials_the_relay_again() {
+    let probe = Probe::default();
+    let relay = LoopbackRelay::new();
+    let mut h = host_controller::spawn_with_dial_out(
+        {
+            let probe = probe.clone();
+            move || probe
+        },
+        relay.clone(),
+    );
+    let bound = serve_both(&mut h);
+    h.send(HostCommand::CreateInvite).unwrap();
+    assert!(await_invite(&mut h).is_some(), "no invite was minted");
+
+    relay.cut();
+    let seen = await_fault(&mut h, "the relay connection closed — reconnecting");
+    let (withdrawn, more) = await_event(&mut h, T, |e| matches!(e, HostEvent::InviteWithdrawn));
+    assert!(
+        withdrawn.is_some(),
+        "the invite was not withdrawn; saw {seen:?} {more:?}"
+    );
+    assert!(
+        probe.n(&probe.invites_revoked) >= 1,
+        "the invite was not revoked"
+    );
+    let (lan, more) = await_event(
+        &mut h,
+        T,
+        |e| matches!(e, HostEvent::StateChanged(s) if lan_only(s)),
+    );
+    assert!(
+        lan.is_some(),
+        "the host did not report the LAN route alone; saw {more:?}"
+    );
+    assert!(
+        !more.iter().any(|e| matches!(
+            e,
+            HostEvent::StateChanged(
+                HostState::Error { .. } | HostState::Stopped | HostState::Stopping
+            )
+        )),
+        "losing one route ended the host: {more:?}"
+    );
+    assert!(port_open(bound), "losing the relay closed the listener");
+
+    let s = h
+        .wait_for_state(T, serves_both)
+        .expect("the relay was not dialled again");
+    assert_eq!(s.bound(), Some(bound));
+    assert_eq!(relay.connects.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        relay.dropped.load(Ordering::SeqCst),
+        1,
+        "the dead relay source was kept"
+    );
+    assert_eq!(probe.n(&probe.capture_stopped), 0, "capture was stopped");
+    assert_eq!(probe.n(&probe.input_closed), 0, "input was closed");
+    assert!(h.shutdown_and_join(T));
+}
+
+/// **Stop listening closes the port and the LAN sessions, and nothing else.**
+/// A phone that came in through the relay stays connected.
+#[test]
+fn stop_listening_closes_only_the_listener_and_its_sessions() {
+    use std::io::{Read, Write};
+    let probe = Probe::default();
+    probe.authenticate.store(1, Ordering::SeqCst);
+    let relay = LoopbackRelay::new();
+    let mut h = host_controller::spawn_with_dial_out(
+        {
+            let probe = probe.clone();
+            move || probe
+        },
+        relay.clone(),
+    );
+    let bound = serve_both(&mut h);
+
+    let mut lan_phone = TcpStream::connect(bound).unwrap();
+    let lan_label = lan_phone.local_addr().unwrap().to_string();
+    lan_phone.write_all(b"auth-lan").unwrap();
+    h.wait_for_state(T, |s| s.peers() == 1)
+        .expect("the LAN phone");
+    let mut relay_phone = TcpStream::connect(relay.door()).unwrap();
+    relay_phone.write_all(b"auth-relay").unwrap();
+    h.wait_for_state(T, |s| s.peers() == 2)
+        .expect("the relayed phone");
+
+    h.send(HostCommand::StopListening).unwrap();
+    let (gone, seen) = await_event(
+        &mut h,
+        T,
+        |e| matches!(e, HostEvent::PeerDisconnected { peer, count: 1 } if *peer == lan_label),
+    );
+    assert!(
+        gone.is_some(),
+        "the LAN session survived Stop listening; saw {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|e| matches!(e, HostEvent::InviteWithdrawn)),
+        "no InviteWithdrawn: {seen:?}"
+    );
+    let s = h
+        .wait_for_state(T, |s| relay_only(s) && s.peers() == 1)
+        .expect("the host did not settle on the relay with one peer");
+    assert!(!s.is_listening(), "the host still reports a listener");
+    assert!(!port_open(bound), "the port is still open");
+
+    relay_phone
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    let mut byte = [0u8; 1];
+    match relay_phone.read(&mut byte) {
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) => {}
+        Ok(0) => panic!("Stop listening disconnected the relayed phone"),
+        other => panic!("unexpected read from the relayed phone: {other:?}"),
+    }
+    assert_eq!(
+        relay.dropped.load(Ordering::SeqCst),
+        0,
+        "the relay route was closed"
+    );
+    assert_eq!(probe.n(&probe.capture_stopped), 0, "capture was stopped");
+    assert!(h.shutdown_and_join(T));
+}
+
+/// Stop listening is a command about ONE route. It never quietly does more.
+#[test]
+fn stop_listening_is_refused_unless_another_route_is_serving() {
+    let mut h = host_controller::spawn_with_dial_out(Probe::default, LoopbackRelay::new());
+    h.send(HostCommand::StopListening).unwrap();
+    await_fault(&mut h, "not running");
+
+    let bound = start_on_ephemeral(&mut h);
+    h.send(HostCommand::StopListening).unwrap();
+    await_fault(&mut h, "only route");
+    assert!(port_open(bound), "a refused Stop listening closed the port");
+    h.send(HostCommand::Stop).unwrap();
+    h.wait_for_state(T, |s| *s == HostState::Stopped).unwrap();
+
+    h.send(HostCommand::StartViaRelay).unwrap();
+    h.wait_for_state(T, relay_only).unwrap();
+    h.send(HostCommand::StopListening).unwrap();
+    await_fault(&mut h, "not listening");
+    assert!(h.shutdown_and_join(T));
+}
+
+#[test]
+fn stop_closes_both_routes() {
+    let probe = Probe::default();
+    let relay = LoopbackRelay::new();
+    let mut h = host_controller::spawn_with_dial_out(
+        {
+            let probe = probe.clone();
+            move || probe
+        },
+        relay.clone(),
+    );
+    let bound = serve_both(&mut h);
+    h.send(HostCommand::Stop).unwrap();
+    h.wait_for_state(T, |s| *s == HostState::Stopped)
+        .expect("Stop did not stop a host serving both routes");
+    assert!(!port_open(bound), "Stop left the listener open");
+    assert_eq!(
+        relay.dropped.load(Ordering::SeqCst),
+        1,
+        "Stop left the relay connected"
+    );
+    assert_eq!(probe.n(&probe.capture_stopped), 1);
+    assert_eq!(probe.n(&probe.input_closed), 1);
+    assert!(h.shutdown_and_join(T));
+}
+
+/// Clicking Start while the relay is still being dialled is no longer refused:
+/// the listener comes up, and the relay joins it when it answers.
+#[test]
+fn a_listener_started_while_the_relay_dials_is_joined_by_the_relay() {
+    let probe = Probe::default();
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let mut h = host_controller::spawn_with_dial_out(
+        {
+            let probe = probe.clone();
+            move || probe
+        },
+        SlowDialOut {
+            relay: sa("203.0.113.9:9443"),
+            delay: Duration::from_millis(400),
+            dropped: dropped.clone(),
+        },
+    );
+    h.send(HostCommand::StartViaRelay).unwrap();
+    h.wait_for_state(T, |s| *s == HostState::Starting).unwrap();
+    h.send(HostCommand::Start {
+        bind: sa("127.0.0.1:0"),
+    })
+    .unwrap();
+    let s = h
+        .wait_for_state(T, lan_only)
+        .expect("the listener did not come up while the relay was dialling");
+    let bound = s.bound().unwrap();
+    let s = h
+        .wait_for_state(T, serves_both)
+        .expect("the relay did not join the listening host");
+    assert_eq!(s.bound(), Some(bound));
+    assert_eq!(
+        probe.n(&probe.capture_started),
+        1,
+        "capture was started twice"
+    );
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        0,
+        "the relay source was thrown away"
+    );
+    assert!(h.shutdown_and_join(T));
+}
+
+/// A relay that refuses is reported, and a host that is already listening
+/// stays exactly as it was — no Error state for a host that is serving.
+#[test]
+fn a_relay_that_refuses_does_not_stop_a_listening_host() {
+    let refusing = RefusingDialOut::default();
+    let mut h = host_controller::spawn_with_dial_out(Probe::default, refusing.clone());
+    let bound = start_on_ephemeral(&mut h);
+    h.send(HostCommand::StartViaRelay).unwrap();
+    let (refused, seen) = await_event(
+        &mut h,
+        T,
+        |e| matches!(e, HostEvent::RelayRefused { why } if why.contains("not enrolled")),
+    );
+    assert!(
+        refused.is_some(),
+        "the refusal was not reported as a refusal: {seen:?}"
+    );
+    let (bad, more) = await_event(&mut h, Duration::from_millis(500), |e| {
+        matches!(e, HostEvent::StateChanged(_))
+    });
+    assert!(
+        bad.is_none(),
+        "a refused relay changed a listening host's state: {bad:?} after {seen:?} {more:?}"
+    );
+    assert!(port_open(bound), "a refused relay closed the listener");
+    assert_eq!(refusing.attempts.load(Ordering::SeqCst), 1);
+    assert!(h.shutdown_and_join(T));
+}
+
+/// A listener that cannot bind is reported, and a relay host keeps serving.
+#[test]
+fn a_relay_host_that_cannot_bind_keeps_serving() {
+    let probe = Probe::default();
+    let mut h = host_controller::spawn_with_dial_out(
+        {
+            let probe = probe.clone();
+            move || probe
+        },
+        LoopbackRelay::new(),
+    );
+    h.send(HostCommand::StartViaRelay).unwrap();
+    h.wait_for_state(T, relay_only).unwrap();
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    h.send(HostCommand::Start {
+        bind: taken.local_addr().unwrap(),
+    })
+    .unwrap();
+    let seen = await_fault(&mut h, "could not bind");
+    assert!(
+        !seen.iter().any(|e| matches!(e, HostEvent::StateChanged(_))),
+        "a failed bind changed a serving host's state: {seen:?}"
+    );
+    h.send(HostCommand::CreateInvite).unwrap();
+    assert!(
+        await_invite(&mut h).is_some(),
+        "the relay host stopped minting"
+    );
+    assert!(matches!(
+        probe.minted_for.lock().unwrap().clone(),
+        Some(host_controller::Reach::ViaRelay { .. })
+    ));
+    assert_eq!(
+        probe.n(&probe.capture_stopped),
+        0,
+        "a failed bind stopped capture"
+    );
+    assert!(h.shutdown_and_join(T));
+}
+
+/// The invite is minted for the routes the host is actually serving — both.
+#[test]
+fn a_host_serving_both_routes_mints_for_both() {
+    let probe = Probe::default();
+    let mut h = host_controller::spawn_with_dial_out(
+        {
+            let probe = probe.clone();
+            move || probe
+        },
+        LoopbackRelay::new(),
+    );
+    let bound = serve_both(&mut h);
+    h.send(HostCommand::CreateInvite).unwrap();
+    assert!(await_invite(&mut h).is_some());
+    assert_eq!(
+        probe.minted_for.lock().unwrap().clone(),
+        Some(host_controller::Reach::Both {
+            bound,
+            relay: sa("203.0.113.9:9443"),
+            session: "AAAAAAAAAAAAAAAAAAAAAA".into(),
+        })
+    );
+    assert!(h.shutdown_and_join(T));
+}
+
+/// **Each route releases its own pre-auth slots, and revokes its own peers.**
+///
+/// An authentication is forwarded to every route, and only the route that
+/// accepted the peer holds its slot. If the forward reached only one route, the
+/// other's authenticated phones would keep their slots: after
+/// `PreAuthLimit::MAX_PENDING` of them that route would refuse everyone, and
+/// each would be cut off at the pre-auth deadline despite having proven itself.
+/// More phones than the bound are connected on EACH route to show neither
+/// happens, and one peer on each route is then revoked.
+#[test]
+fn both_routes_release_authenticated_slots_and_revoke_their_own_peers() {
+    use std::io::Write;
+    let probe = Probe::default();
+    probe.authenticate.store(1, Ordering::SeqCst);
+    let relay = LoopbackRelay::new();
+    let mut h = host_controller::spawn_with_dial_out(
+        {
+            let probe = probe.clone();
+            move || probe
+        },
+        relay.clone(),
+    );
+    let bound = serve_both(&mut h);
+    let per_route = host_controller::PreAuthLimit::MAX_PENDING + 1;
+    let mut phones = Vec::new();
+    let mut labels = Vec::new();
+    for i in 0..per_route {
+        let mut lan = TcpStream::connect(bound).unwrap();
+        labels.push(lan.local_addr().unwrap().to_string());
+        lan.write_all(b"auth").unwrap();
+        phones.push(lan);
+        h.wait_for_state(T, |s| s.peers() == 2 * i + 1)
+            .unwrap_or_else(|| panic!("LAN phone {} was not admitted", i + 1));
+        let mut relayed = TcpStream::connect(relay.door()).unwrap();
+        relayed.write_all(b"auth").unwrap();
+        phones.push(relayed);
+        h.wait_for_state(T, |s| s.peers() == 2 * i + 2)
+            .unwrap_or_else(|| panic!("relayed phone {} was not admitted", i + 1));
+    }
+    let total = 2 * per_route;
+
+    let relayed_label = format!("via relay {} #1", relay.relay);
+    for (n, peer) in [labels[0].clone(), relayed_label].into_iter().enumerate() {
+        h.send(HostCommand::RevokePeer { peer: peer.clone() })
+            .unwrap();
+        let (hit, seen) = await_event(
+            &mut h,
+            T,
+            |e| matches!(e, HostEvent::PeerDisconnected { peer: p, .. } if *p == peer),
+        );
+        assert!(hit.is_some(), "revoking {peer} did nothing; saw {seen:?}");
+        h.wait_for_state(T, |s| s.peers() == total - n - 1)
+            .unwrap_or_else(|| panic!("the count did not fall after revoking {peer}"));
+    }
+    assert!(h.shutdown_and_join(T));
+}
+
+// ── the relay-only host keeps its relay ───────────────────────────────────────
+//
+// 2026-09-17: a host serving only through the relay lost its control connection
+// at 09:32 and stayed unreachable until someone restarted it ten hours later.
+
+/// A relay route that ends the moment it is up, and counts how often it is
+/// dialled — a relay that accepts the host and drops it at once.
+struct CountingDeadDialOut {
+    relay: SocketAddr,
+    connects: Arc<AtomicUsize>,
+}
+
+impl host_controller::DialOut for CountingDeadDialOut {
+    fn connect(&mut self) -> host_controller::source::DialFuture<'_> {
+        let relay = self.relay;
+        let connects = self.connects.clone();
+        Box::pin(async move {
+            connects.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(DeadSource { relay }) as Box<dyn host_controller::PeerSource>)
+        })
+    }
+}
+
+/// Accepts the host once, then refuses it — an enrolment withdrawn while the
+/// host was connected, or a relay restarted with a different host list.
+#[derive(Clone)]
+struct OnceThenRefused {
+    relay: LoopbackRelay,
+    calls: Arc<AtomicUsize>,
+}
+
+impl host_controller::DialOut for OnceThenRefused {
+    fn connect(&mut self) -> host_controller::source::DialFuture<'_> {
+        let calls = self.calls.fetch_add(1, Ordering::SeqCst);
+        if calls == 0 {
+            return self.relay.connect();
+        }
+        Box::pin(async {
+            Err(host_controller::DialFailure::refused(
+                "the relay refused this host: not enrolled",
+            ))
+        })
+    }
+}
+
+/// **A relay-only host whose relay connection ends dials it again**, and comes
+/// back serving. Capture and input go with the lost route — a host with no way
+/// in holds neither — and return with it; the code on screen is withdrawn.
+#[test]
+fn a_relay_only_host_dials_its_relay_again_when_the_connection_ends() {
+    let probe = Probe::default();
+    let relay = LoopbackRelay::new();
+    let mut h = host_controller::spawn_with_dial_out(
+        {
+            let probe = probe.clone();
+            move || probe
+        },
+        relay.clone(),
+    );
+    h.send(HostCommand::StartViaRelay).unwrap();
+    h.wait_for_state(T, relay_only)
+        .expect("the relay never came up");
+    h.send(HostCommand::CreateInvite).unwrap();
+    assert!(await_invite(&mut h).is_some());
+
+    relay.cut();
+    let seen = await_fault(&mut h, "the relay connection closed — reconnecting");
+    let (retry, more) = await_event(&mut h, T, |e| matches!(e, HostEvent::RelayRetrying { .. }));
+    let everything: Vec<_> = seen.iter().chain(more.iter()).collect();
+    assert!(
+        matches!(
+            retry,
+            Some(HostEvent::RelayRetrying {
+                attempt: 1,
+                in_seconds: 0,
+                ..
+            })
+        ),
+        "the first re-dial should be immediate and announced: {retry:?}"
+    );
+    assert!(
+        everything
+            .iter()
+            .any(|e| matches!(e, HostEvent::InviteWithdrawn)),
+        "the code naming the lost session was not withdrawn: {everything:?}"
+    );
+    assert!(
+        everything
+            .iter()
+            .any(|e| matches!(e, HostEvent::StateChanged(HostState::Starting))),
+        "a host with no way in did not say it was starting again: {everything:?}"
+    );
+    assert!(
+        !everything
+            .iter()
+            .any(|e| matches!(e, HostEvent::StateChanged(HostState::Error { .. }))),
+        "losing the relay still ended the host: {everything:?}"
+    );
+
+    h.wait_for_state(T, relay_only)
+        .expect("the host did not come back through the relay");
+    assert_eq!(relay.connects.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        relay.dropped.load(Ordering::SeqCst),
+        1,
+        "the dead source was kept"
+    );
+    assert_eq!(
+        probe.n(&probe.capture_stopped),
+        1,
+        "capture outlived the only route"
+    );
+    assert_eq!(
+        probe.n(&probe.input_closed),
+        1,
+        "input outlived the only route"
+    );
+    assert_eq!(
+        probe.n(&probe.capture_started),
+        2,
+        "capture did not come back with the relay"
+    );
+    assert_eq!(
+        probe.n(&probe.input_opened),
+        2,
+        "input did not come back with the relay"
+    );
+    assert!(h.shutdown_and_join(T));
+}
+
+/// **A relay that refuses the re-dial is named as refusing, and not retried.**
+/// "Unreachable, trying again" needs nothing from the operator; "refused" needs
+/// a human, so it arrives as its own event and the host stops dialling.
+#[test]
+fn a_relay_that_refuses_the_redial_is_named_and_not_retried() {
+    let relay = LoopbackRelay::new();
+    let dial = OnceThenRefused {
+        relay: relay.clone(),
+        calls: Arc::default(),
+    };
+    let mut h = host_controller::spawn_with_dial_out(Probe::default, dial.clone());
+    h.send(HostCommand::StartViaRelay).unwrap();
+    h.wait_for_state(T, relay_only)
+        .expect("the relay never came up");
+
+    relay.cut();
+    let (refused, seen) = await_event(&mut h, T, |e| matches!(e, HostEvent::RelayRefused { .. }));
+    match refused {
+        Some(HostEvent::RelayRefused { why }) => assert!(why.contains("not enrolled"), "{why}"),
+        other => panic!("no refusal after the re-dial: {other:?} after {seen:?}"),
+    }
+    h.wait_for_state(T, |s| matches!(s, HostState::Error { .. }))
+        .expect("a refused host with no route did not stop");
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(
+        dial.calls.load(Ordering::SeqCst),
+        2,
+        "a refused relay was dialled again"
+    );
+    assert!(h.shutdown_and_join(T));
+}
+
+/// **Stop during a re-dial's backoff stops it.** The operator's Stop is final:
+/// nothing dials after it.
+#[test]
+fn stop_ends_a_redial_that_is_waiting_out_its_backoff() {
+    let connects = Arc::new(AtomicUsize::new(0));
+    let mut h = host_controller::spawn_with_dial_out(
+        Probe::default,
+        CountingDeadDialOut {
+            relay: sa("203.0.113.9:9443"),
+            connects: connects.clone(),
+        },
+    );
+    h.send(HostCommand::StartViaRelay).unwrap();
+    // Wait until a re-dial is sitting in a real (non-zero) backoff.
+    let (waiting, seen) = await_event(
+        &mut h,
+        T,
+        |e| matches!(e, HostEvent::RelayRetrying { in_seconds, .. } if *in_seconds >= 1),
+    );
+    assert!(waiting.is_some(), "no backoff was ever announced: {seen:?}");
+    h.send(HostCommand::Stop).unwrap();
+    h.wait_for_state(T, |s| *s == HostState::Stopped)
+        .expect("Stop did not stop a host that was re-dialling");
+    let at_stop = connects.load(Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(2500));
+    assert_eq!(
+        connects.load(Ordering::SeqCst),
+        at_stop,
+        "the relay was dialled after Stop"
+    );
     assert!(h.shutdown_and_join(T));
 }

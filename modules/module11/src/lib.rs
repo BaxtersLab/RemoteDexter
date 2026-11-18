@@ -18,6 +18,7 @@ pub mod delta_engine;
 pub mod encoder;
 pub mod stream_pump;
 pub mod bitrate;
+pub mod scale;
 
 // Re-export main types
 pub use types::*;
@@ -27,3 +28,4 @@ pub use delta_engine::*;
 pub use encoder::*;
 pub use stream_pump::StreamPump;
 pub use bitrate::*;
+pub use scale::*;

@@ -60,12 +60,29 @@ data class PairedHost(
          */
         fun of(addr: String, port: Int, pinHex: String): PairedHost? {
             if (addr.isBlank()) return null
+            // A tab or newline would split the stored line into other fields,
+            // so such a value could never have been stored and read back. ONLY
+            // control characters are refused: a LAN record that decodes today
+            // must decode identically, and a space never broke the format.
+            if (addr.trim().any { it.isISOControl() }) return null
             // Port 0 means "any port" to the OS, never a destination.
             if (port !in 1..65535) return null
+            val pin = normalisedPin(pinHex) ?: return null
+            return PairedHost(addr.trim(), port, pin)
+        }
+
+        /**
+         * A pin in the one form it is stored and compared in, or null.
+         *
+         * Shared by both routes, so a LAN route and a relay route for the same
+         * host cannot disagree about what a valid pin looks like — and so the
+         * question "do these two routes pin the same key" is a string compare.
+         */
+        fun normalisedPin(pinHex: String): String? {
             val pin = pinHex.trim().lowercase()
             if (pin.length != PIN_HEX_LENGTH) return null
             if (decodeHex(pin) == null) return null
-            return PairedHost(addr.trim(), port, pin)
+            return pin
         }
 
         /**

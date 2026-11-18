@@ -112,15 +112,31 @@ pub fn rect(surface: SurfaceId) -> Option<(i32, i32, i32, i32)> {
 /// back RGBA — the Windows crate converts once, inside the capture, rather than
 /// returning BGRA for this function to swap in place. A frame's byte order
 /// should not depend on how far it has travelled.
-pub fn capture_rgba(surface: SurfaceId) -> Result<module11::RawFrame, String> {
+///
+/// `Ok(None)` is a capture that is alive and has no picture yet — see
+/// [`module11::StreamError::NoFrameYet`]. The caller waits and asks again; it is
+/// not an error and must not end a stream.
+pub fn capture_rgba(surface: SurfaceId) -> Result<Option<module11::RawFrame>, String> {
     #[cfg(target_os = "linux")]
     {
         linux::capture(surface)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        windows_desktop::capture(surface)
+        windows_desktop::capture(surface).map(Some)
     }
+}
+
+/// Whether a capture error leaves the capture source worth keeping.
+///
+/// Only "no picture yet" does: the stream is alive. Dropping it there is what
+/// made a still desktop expensive — the next attempt paid a fresh portal
+/// handshake, on the same still desktop, and failed the same way.
+// Linux's capture keeps a long-lived portal source; Windows captures without
+// one, so it has nothing to keep and never asks.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn keeps_the_source(error: &module11::StreamError) -> bool {
+    matches!(error, module11::StreamError::NoFrameYet)
 }
 
 /// Release the platform capture session after all client producers have
@@ -174,7 +190,7 @@ mod linux {
         })
     }
 
-    pub fn capture(surface: SurfaceId) -> Result<module11::RawFrame, String> {
+    pub fn capture(surface: SurfaceId) -> Result<Option<module11::RawFrame>, String> {
         if surface.raw() != DESKTOP_ID {
             return Err(format!(
                 "this host shares the desktop (id {DESKTOP_ID}); there is no window {} to capture \
@@ -261,8 +277,14 @@ mod linux {
         }
 
         let result = match guard.cap.as_mut() {
-            Some(cap) => cap.capture().map_err(|e| format!("{e}")),
-            None => Err("desktop capture is unavailable".to_string()),
+            Some(cap) => cap.capture(),
+            None => return Err("desktop capture is unavailable".to_string()),
+        };
+        let result = match result {
+            Ok(frame) => Ok(Some(frame)),
+            // Alive and still. Keep the source; the caller asks again.
+            Err(e) if keeps_the_source(&e) => return Ok(None),
+            Err(e) => Err(format!("{e}")),
         };
         if result.is_err() {
             // Drop the dead session rather than handing back the same corpse on

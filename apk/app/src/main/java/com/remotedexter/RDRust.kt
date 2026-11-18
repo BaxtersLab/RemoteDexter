@@ -119,6 +119,33 @@ object RDRust {
     )
 
     /**
+     * Reconnect THROUGH THE RELAY to a host that has already enrolled this
+     * device — **no token**, and no QR.
+     *
+     * [startPairedSession] for the relay route. `session` is the id the relay
+     * gave the host, kept from the pairing invite; it stays the same across the
+     * HOST's restarts, which is what makes this possible, but it changes when
+     * the RELAY restarts, and a refusal after that looks exactly like a host
+     * that is not running — the relay gives both the same answer on purpose.
+     *
+     * `session` is a credential against the relay: anyone holding it can
+     * occupy the host's join slot. It is never logged, never shown, and never
+     * put in an Intent.
+     *
+     * **The pin comes before the session on purpose.** In the natural order this
+     * would have exactly the parameter types of [startSession], so a stored
+     * session id passed where a pairing token belongs would compile without
+     * complaint. In this order it cannot. Descriptor:
+     * `(Ljava/lang/String;I[BLjava/lang/String;)V`
+     */
+    external fun startPairedRelaySession(
+        relayIp: String,
+        relayPort: Int,
+        hostPubkey: ByteArray,
+        session: String
+    )
+
+    /**
      * Send one JSON command to the live session. Descriptor:
      * `(Ljava/lang/String;)Z`
      *

@@ -39,10 +39,12 @@ pub mod token;
 
 pub use identity::{identity_b64, load_or_create, IdentityError};
 pub use invite::{
-    decode, field_carries_separator, signature_is_valid, DecodeError, Decoded, LegacyInvite,
-    RelayInvite, SignedInvite, CANONICAL_SEPARATOR, INVITE_KIND, INVITE_VERSION,
-    LEGACY_INVITE_VERSION, RELAY_INVITE_VERSION, SESSION_PROTOCOL,
+    decode, field_carries_separator, signature_is_valid, DecodeError, Decoded, DualInvite,
+    LegacyInvite, RelayInvite, SignedInvite, CANONICAL_SEPARATOR, DUAL_INVITE_VERSION, INVITE_KIND,
+    INVITE_VERSION, LEGACY_INVITE_VERSION, RELAY_INVITE_VERSION, SESSION_PROTOCOL,
 };
 pub use qr::QrBitmap;
-pub use service::{Invitation, MintError, PairingService, RelayInvitation, CAP_CONTROL, CAP_VIEW};
+pub use service::{
+    DualInvitation, Invitation, MintError, PairingService, RelayInvitation, CAP_CONTROL, CAP_VIEW,
+};
 pub use token::{RedeemError, RedemptionHandle, Token, TokenDigest, TokenStore, TOKEN_TTL};

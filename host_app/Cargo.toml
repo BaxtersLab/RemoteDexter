@@ -49,7 +49,7 @@ ed25519-dalek = "2"
 #
 # scripts/check_no_x11.sh proves it against the resolved feature graph AND the
 # linked binary, because a feature list is a claim and `ldd` is evidence.
-eframe = { version = "=0.36.1", default-features = false, features = [
+eframe = { version = "=0.36.2", default-features = false, features = [
     "wayland",
     "wgpu",
     "default_fonts",
@@ -70,7 +70,19 @@ snow = "0.9"
 sha2 = "0.10"
 base64 = "0.22"
 
+# Linux: a desktop notification when a second host is refused, so a launch from
+# the application menu -- where nothing shows stderr -- is not silent. zbus is
+# already resolved through module11's portal client, so this adds an edge to
+# the graph, not a crate, and the tokio feature it needs is already on.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+# TCP_NOTSENT_LOWAT on the session socket (session_writer). Already in the graph
+# through tokio with the same feature; this adds an edge, not a package.
+socket2 = { version = "0.6", features = ["all"] }
+
 [dev-dependencies]
+# Paused-clock tests (session_writer::WRITE_STALL) without waiting 30 real seconds.
+tokio = { version = "1", features = ["test-util"] }
 # The relay SERVER, for tests only: the dial-out is proven against a real relay
 # on loopback rather than a hand-written fake that would agree with whatever
 # this file happens to send.

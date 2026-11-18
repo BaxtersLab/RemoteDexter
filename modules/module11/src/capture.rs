@@ -151,7 +151,7 @@ impl ScreenCapturer {
             }
             #[cfg(all(target_os = "linux", feature = "linux-capture"))]
             Backend::Portal(cap) => {
-                use crate::capture_health::{action, Action, Observation};
+                use crate::capture_health::{action, Observation};
                 let force = self.last.is_none();
                 let fetched = cap.capture_rgba(force);
                 // Ask whether the stream is alive BEFORE deciding what a
@@ -168,24 +168,84 @@ impl ScreenCapturer {
                     }
                     Observation::Quiet
                 };
-                match (action(observed, self.last.is_some()), fetched) {
-                    (Action::Serve, Ok(Some(frame))) => {
-                        self.width = frame.width;
-                        self.height = frame.height;
-                        self.last = Some(frame.clone());
-                        Ok(frame)
-                    }
-                    // Serve without a frame cannot arise; fail closed anyway.
-                    (Action::Serve, _) => Err(StreamError::CaptureFailed),
-                    (Action::ReuseLast, _) => self.last.clone().ok_or(StreamError::CaptureFailed),
-                    (Action::Fault, _) => Err(StreamError::CaptureFailed),
+                let outcome =
+                    portal_outcome(action(observed, self.last.is_some()), fetched, &self.last);
+                if let Ok(frame) = &outcome {
+                    self.width = frame.width;
+                    self.height = frame.height;
+                    self.last = Some(frame.clone());
                 }
+                outcome
             }
             Backend::Synthetic { frame } => {
                 *frame = frame.wrapping_add(1);
                 Ok(synthetic_frame(self.width, self.height))
             }
         }
+    }
+}
+
+/// What one portal capture hands back, given the health policy's decision.
+///
+/// Pulled out of `ScreenCapturer::capture` so it can be tested without a live
+/// screencast: this is where "a still desktop with no first picture" becomes
+/// either "wait" or, as it did until 2026-09-18, a fatal error reading
+/// "permission denied".
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "linux-capture")),
+    allow(dead_code)
+)]
+pub(crate) fn portal_outcome(
+    decided: crate::capture_health::Action,
+    fetched: Result<Option<RawFrame>, String>,
+    last: &Option<RawFrame>,
+) -> Result<RawFrame, StreamError> {
+    use crate::capture_health::Action;
+    match (decided, fetched) {
+        (Action::Serve, Ok(Some(frame))) => Ok(frame),
+        // Serve without a frame cannot arise; fail closed anyway.
+        (Action::Serve, _) => Err(StreamError::CaptureFailed),
+        (Action::ReuseLast, _) => last.clone().ok_or(StreamError::CaptureFailed),
+        (Action::AwaitFirst, _) => Err(StreamError::NoFrameYet),
+        (Action::Fault, _) => Err(StreamError::CaptureFailed),
+    }
+}
+
+#[cfg(test)]
+mod portal_outcome_tests {
+    use super::*;
+    use crate::capture_health::{action, Observation};
+
+    fn frame(w: u32) -> RawFrame {
+        RawFrame {
+            data: vec![0; 4],
+            width: w,
+            height: 1,
+        }
+    }
+
+    /// **A still desktop with no first picture waits; it does not fail.** The
+    /// sequence behind 2026-09-18 13:07 and 21:20: a rebuilt capture, a quiet
+    /// stream, nothing in hand.
+    #[test]
+    fn a_quiet_stream_with_no_first_picture_is_waited_on_not_failed() {
+        let got = portal_outcome(action(Observation::Quiet, false), Ok(None), &None);
+        assert!(
+            matches!(got, Err(StreamError::NoFrameYet)),
+            "{got:?}",
+            got = got.map(|f| f.width)
+        );
+    }
+
+    /// And the cases around it are what they were.
+    #[test]
+    fn a_fresh_frame_is_served_a_quiet_one_reuses_the_last_and_an_ended_one_fails() {
+        let fresh = portal_outcome(action(Observation::Fresh, false), Ok(Some(frame(7))), &None);
+        assert_eq!(fresh.map(|f| f.width).ok(), Some(7));
+        let reused = portal_outcome(action(Observation::Quiet, true), Ok(None), &Some(frame(9)));
+        assert_eq!(reused.map(|f| f.width).ok(), Some(9));
+        let ended = portal_outcome(action(Observation::Ended, true), Ok(None), &Some(frame(9)));
+        assert!(matches!(ended, Err(StreamError::CaptureFailed)));
     }
 }
 

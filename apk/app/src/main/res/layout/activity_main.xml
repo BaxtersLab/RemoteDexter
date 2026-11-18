@@ -108,7 +108,6 @@
             android:layout_height="wrap_content"
             android:minHeight="48dp"
             android:textSize="15sp"
-            android:maxLines="1"
             android:hint="@string/compose_hint"
             android:importantForAutofill="no"
             android:inputType="text|textNoSuggestions"

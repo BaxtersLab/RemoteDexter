@@ -38,8 +38,8 @@ import org.json.JSONObject
  *   ← {"type":"windows","windows":[{"id":N,...}]}
  *   → {"type":"permit_window","window":N}
  *   ← {"type":"ack","for":"permit_window"}
- *   → {"type":"stream_start","window":N}
- *   ← {"type":"ack","for":"stream_start"}      then frames flow
+ *   → {"type":"stream_start","window":N,"input_coordinates":"normalized_v1"}
+ *   ← {"type":"ack","for":"stream_start","input_coordinates":"normalized_v1"}
  * ```
  *
  * Frame *delivery* is separate and surface-driven: [FrameReceiver] registers
@@ -50,15 +50,15 @@ object SessionOrchestrator {
 
     private const val TAG = "SessionOrchestrator"
 
-    /** Poll cadence and ceiling while waiting for the worker to connect. */
+    /** Poll cadence while waiting for the worker to connect; the ceiling is [ConnectCeiling]'s, by route. */
     private const val POLL_MS = 250L
-    private const val POLL_MAX_TRIES = 40 // 40 × 250ms = 10s before giving up
 
     private enum class Phase { Idle, Connecting, Listing, Permitting, Starting, Streaming, Failed }
 
     private val main = Handler(Looper.getMainLooper())
 
     @Volatile private var _phase = Phase.Idle
+    @Volatile private var pointerCoordinateSpace: PointerCoordinateSpace? = null
 
     /**
      * Session phase, with a setter that notifies [onPhaseChanged].
@@ -72,6 +72,7 @@ object SessionOrchestrator {
     private var phase: Phase
         get() = _phase
         set(value) {
+            if (value != Phase.Streaming) pointerCoordinateSpace = null
             if (_phase == value) return
             _phase = value
             onPhaseChanged?.invoke(value == Phase.Streaming, value.name)
@@ -94,6 +95,9 @@ object SessionOrchestrator {
      * should ever change it.
      */
     fun currentWindowId(): Long = windowId
+
+    fun currentPointerCoordinateSpace(): PointerCoordinateSpace? =
+        if (phase == Phase.Streaming) pointerCoordinateSpace else null
 
     /**
      * Begin a connection the user explicitly asked for.
@@ -137,14 +141,22 @@ object SessionOrchestrator {
         }
         val label = "relay ${invite.relayAddr}"
         SessionStateHolder.set(SessionState.Connecting(label))
-        // NO pending invite is recorded, so `rememberHostForReconnect` stores
-        // nothing. A relay session has no address to reconnect to, and the
-        // session id is single-use and expires with the invite — a stored
-        // "paired host" for this route would be a row that can never work.
-        // The native refuses the same thing from the other side: a paired
-        // reconnect has no relay session to present. Reconnection through a
-        // relay means the host issues a fresh code.
-        pendingInvite = null
+        // What to remember once the host has accepted this device. A relay
+        // pairing used to leave nothing: the relay gave the host a new random
+        // session id every time it registered, so the id was dead after the
+        // host's next restart. An enrolled host now keeps its id for as long as
+        // the relay runs, so the route is worth keeping — and it is recorded
+        // HERE but stored only on `connected`, never on scan.
+        //
+        // Built from the invite alone, and never from its token.
+        pendingPairing = PairedHostRecord.viaRelay(
+            invite.hostIdentityPubkey,
+            invite.relayAddr,
+            invite.relayPort,
+            invite.session,
+            invite.hostPubkey
+        )
+        reconnectingViaRelay = false
         hostLabel = label
         val pin = decodeHostPin(invite.hostPubkey)
         if (pin == null) {
@@ -161,7 +173,7 @@ object SessionOrchestrator {
                 invite.token,
                 pin
             )
-            watch(context)
+            watch(context, viaRelay = true)
         } catch (t: Throwable) {
             RdxLog.e(TAG, "native relay session start failed", t)
             SessionStateHolder.set(
@@ -192,7 +204,15 @@ object SessionOrchestrator {
             return
         }
         SessionStateHolder.set(SessionState.Connecting(invite.addr))
-        pendingInvite = invite
+        // The IDENTITY comes from the same invite as the address and the pin.
+        // It is what decides whether a host is one we know, and storing it
+        // beside a different host's address is the failure PairedHostRecord
+        // exists to make unrepresentable — so the record is built in one place,
+        // from one source, or not at all.
+        pendingPairing = PairedHostRecord.of(
+            invite.hostIdentityPubkey, invite.addr, invite.port, invite.hostPubkey
+        )
+        reconnectingViaRelay = false
         hostLabel = invite.addr
         val pin = decodeHostPin(invite.hostPubkey)
         if (pin == null) {
@@ -203,7 +223,7 @@ object SessionOrchestrator {
         }
         try {
             RDRust.startSession(invite.addr, invite.port, invite.token, pin)
-            watch(context)
+            watch(context, viaRelay = false)
         } catch (t: Throwable) {
             RdxLog.e(TAG, "native session start failed", t)
             SessionStateHolder.set(
@@ -235,20 +255,37 @@ object SessionOrchestrator {
             return false
         }
         val paired = PairedHostRegistry(context).active()
-        val host = paired?.host
-        if (host == null) {
+        if (paired == null) {
             RdxLog.w(TAG, "reconnect requested with no paired host stored")
             SessionStateHolder.set(
                 SessionState.Failed(FailureReason.InviteParse, "no paired host — scan a QR first")
             )
             return false
         }
-        SessionStateHolder.set(SessionState.Connecting(host.addr))
-        pendingInvite = null
-        hostLabel = host.addr
+        // The route this device last paired by. A LAN route reconnects exactly
+        // as it always has; a relay route presents the session id kept from the
+        // relay pairing. The label names the route and never the session.
+        val route = paired.reconnectRoute()
+        val label = paired.label()
+        SessionStateHolder.set(SessionState.Connecting(label))
+        // A reconnect has no pairing to record: the record is already stored,
+        // and the one it would write is the one it read.
+        pendingPairing = null
+        reconnectingViaRelay = route is PairedHostRecord.Reconnect.ViaRelay
+        hostLabel = label
         try {
-            RDRust.startPairedSession(host.addr, host.port, host.pinBytes())
-            watch(context)
+            when (route) {
+                is PairedHostRecord.Reconnect.Lan ->
+                    RDRust.startPairedSession(route.host.addr, route.host.port, route.host.pinBytes())
+                is PairedHostRecord.Reconnect.ViaRelay ->
+                    RDRust.startPairedRelaySession(
+                        route.route.relayAddr,
+                        route.route.relayPort,
+                        route.route.pinBytes(),
+                        route.route.session
+                    )
+            }
+            watch(context, viaRelay = route is PairedHostRecord.Reconnect.ViaRelay)
         } catch (t: Throwable) {
             RdxLog.e(TAG, "native paired session start failed", t)
             SessionStateHolder.set(
@@ -261,7 +298,8 @@ object SessionOrchestrator {
 
     /** End the session deliberately. */
     fun disconnect() {
-        pendingInvite = null
+        pendingPairing = null
+        reconnectingViaRelay = false
         hostLabel = null
         InputController.reset()
         // Invalidate the streaming monitor before native shutdown reports
@@ -321,12 +359,24 @@ object SessionOrchestrator {
      */
     var onClipboardRefused: ((String) -> Unit)? = null
 
-    private var pendingInvite: com.remotedexter.bootstrap18.InviteV4? = null
+    /**
+     * What to store once the host accepts this device: the route just paired
+     * by, built from the invite and never from its token. Null on a reconnect,
+     * which has nothing new to record.
+     */
+    private var pendingPairing: PairedHostRecord? = null
+
+    /**
+     * Whether the connection in progress is a TOKEN-LESS reconnect through the
+     * relay — the one case where a refusal from the relay means "the relay does
+     * not know this host right now" rather than "this code is wrong".
+     */
+    private var reconnectingViaRelay = false
 
     /**
      * The host this session is talking to, for display.
      *
-     * Separate from [pendingInvite] because a reconnect has no invite at all.
+     * Separate from [pendingPairing] because a reconnect has no invite at all.
      * Reading the label off the invite meant the Streaming state was published
      * only on the QR path; on a reconnect the session would stream while the
      * UI still read "Connecting", which is the exact class of silent
@@ -355,13 +405,16 @@ object SessionOrchestrator {
      *
      * Call right after [RDRust.startSession]. Polls [RDRust.sessionStatus] on the
      * main thread, logs each transition, and — when the handshake reports
-     * `connected` — kicks off the streaming negotiation. Gives up after
-     * [POLL_MAX_TRIES] so a host that never answers does not poll forever.
+     * `connected` — kicks off the streaming negotiation. Gives up after the
+     * route's [ConnectCeiling] so a host that never answers does not poll
+     * forever — and a relayed host is not abandoned before the relay itself
+     * would give up on it.
      */
-    fun watch(context: Context) {
+    fun watch(context: Context, viaRelay: Boolean) {
         appContext = context.applicationContext
         reset()
         val generation = watchGeneration
+        val maxTries = ConnectCeiling.tries(viaRelay, POLL_MS)
         phase = Phase.Connecting
         main.post(object : Runnable {
             var tries = 0
@@ -379,7 +432,7 @@ object SessionOrchestrator {
                     }
                     "failed" -> fail(status.substringAfter('|', "connection failed"))
                     else -> {
-                        if (++tries >= POLL_MAX_TRIES) {
+                        if (++tries >= maxTries) {
                             fail("timed out waiting for the host to connect")
                         } else {
                             main.postDelayed(this, POLL_MS)
@@ -404,18 +457,9 @@ object SessionOrchestrator {
      * already there and unchanged.
      */
     private fun rememberHostForReconnect() {
-        val invite = pendingInvite ?: return
+        val pairing = pendingPairing ?: return
         val context = appContext ?: return
-        // The IDENTITY comes from the same invite as the address and the pin.
-        // It is what decides whether a host is one we know, and storing it
-        // beside a different host's address is the failure PairedHostRecord
-        // exists to make unrepresentable — so the record is built in one place,
-        // from one source, or not at all.
-        PairedHostRegistry(context).remember(
-            PairedHostRecord.of(
-                invite.hostIdentityPubkey, invite.addr, invite.port, invite.hostPubkey
-            )
-        )
+        PairedHostRegistry(context).remember(pairing)
     }
 
     /** Send `list_windows` and move into the negotiation. */
@@ -443,7 +487,7 @@ object SessionOrchestrator {
         }
         when (obj.optString("type")) {
             "windows" -> { onWindows(obj); return true }
-            "ack" -> { onAck(obj.optString("for")); return true }
+            "ack" -> { onAck(obj); return true }
             // The host's clipboard, arriving because the operator asked for it.
             // Consumed here rather than routed onward: it is a reply to a
             // command this object sent, and nothing else has any business with
@@ -492,8 +536,10 @@ object SessionOrchestrator {
                         RdxLog.i(TAG, "host refused $forCmd: $reason")
                         onClipboardRefused?.invoke(reason)
                     }
+                    // A refused text run names itself, so the compose field
+                    // can take back what did not reach the desktop.
                     !SessionDenialPolicy.isFatalToSession(forCmd) ->
-                        InputController.onDenied(forCmd, reason)
+                        InputController.onDenied(forCmd, reason, InputJson.textReply(obj))
                     else -> fail("host ${obj.optString("type")} for $forCmd: $reason")
                 }
                 return true
@@ -538,20 +584,30 @@ object SessionOrchestrator {
         send("""{"type":"permit_window","window":$windowId}""", "permit_window")
     }
 
-    private fun onAck(forCmd: String) {
+    private fun onAck(ack: JSONObject) {
+        val forCmd = ack.optString("for")
         when (forCmd) {
             "permit_window" -> {
                 if (phase != Phase.Permitting) return
                 phase = Phase.Starting
-                send("""{"type":"stream_start","window":$windowId}""", "stream_start")
+                send(InputJson.streamStart(windowId), "stream_start")
             }
             "stream_start" -> {
                 if (phase != Phase.Starting) return
+                val space = InputJson.acknowledgedCoordinates(ack)
+                if (space == null) {
+                    fail("host acknowledged an unsupported input coordinate space")
+                    return
+                }
+                pointerCoordinateSpace = space
                 phase = Phase.Streaming
                 hostLabel?.let {
                     SessionStateHolder.set(SessionState.Streaming(it))
                 }
                 RdxLog.i(TAG, "stream_start acked — host is now streaming the desktop")
+                if (space == PointerCoordinateSpace.DESKTOP_PIXELS) {
+                    RdxLog.w(TAG, "legacy host: update the host for adaptive-resolution pointer calibration")
+                }
                 toast("Streaming")
                 monitorStreaming()
             }
@@ -562,6 +618,8 @@ object SessionOrchestrator {
             // that decodes host JSON, matching how this file already handles
             // "windows"/"ack"/"denied"/"error" for its own negotiation.
             "grant_input", "revoke_input" -> InputController.onAck(forCmd)
+            // A text run typed in full settles the phone's copy of it.
+            "input_event" -> InputController.onInputAck(ack)
         }
     }
 
@@ -622,8 +680,9 @@ object SessionOrchestrator {
             // needs with a stack trace they cannot act on.
             RdxLog.w(TAG, "stopSession during failure: ${e.javaClass.simpleName}")
         }
-        SessionStateHolder.set(SessionState.Failed(FailureReason.Stream, reason))
-        toast("Session failed: $reason")
+        val failed = NativeFailure.classify(reason, reconnectingViaRelay)
+        SessionStateHolder.set(failed)
+        toast("Session failed: ${failed.detail}")
     }
 
     /** Keep observing the native socket after negotiation has completed. */

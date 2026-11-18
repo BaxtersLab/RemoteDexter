@@ -1,5 +1,5 @@
 //! The signed invite: v4 for a bound host, v5 for one reached through a relay,
-//! with a strict decoder for v3.
+//! v6 for a host serving BOTH at once, with a strict decoder for v3.
 //!
 //! ## v5 is not "v4 but newer"
 //!
@@ -13,6 +13,16 @@
 //! Everything else is identical, deliberately: the token, the nonce, the
 //! expiry, the capabilities and the pinned Noise key mean exactly what they
 //! meant in v4, and the relay never sees any of them in the clear.
+//!
+//! ## v6 carries both routes, and only both
+//!
+//! A host listening on an interface AND dialled out to a relay can hand a phone
+//! both ways to reach it in one code, and the phone races them (LAN first). v6
+//! carries `addr` and `port` as v4 does and `relay_addr`, `relay_port` and
+//! `session` as v5 does — **all five, always**. A host with one route still
+//! mints v4 or v5, which every app can read; a one-route v6 would be a code an
+//! older app cannot read, for nothing in return. An older app refuses v6 by
+//! number, which is the right failure: it cannot reach a route it does not know.
 //!
 //! ## What the signature covers, and why each field is in it
 //!
@@ -65,6 +75,9 @@ pub const INVITE_VERSION: u8 = 4;
 /// Not a successor to [`INVITE_VERSION`] — see the module docs. A host emits one
 /// or the other according to how it is actually reachable, and never both.
 pub const RELAY_INVITE_VERSION: u8 = 5;
+
+/// The invite schema for a host serving BOTH routes at once. See the module docs.
+pub const DUAL_INVITE_VERSION: u8 = 6;
 
 /// The byte that separates fields in the canonical encoding.
 pub const CANONICAL_SEPARATOR: char = '\n';
@@ -269,6 +282,124 @@ impl RelayInvite {
     }
 }
 
+/// A pairing invitation for a host reachable both on the LAN and through a relay.
+///
+/// Every field of [`SignedInvite`] and every field of [`RelayInvite`], and one
+/// token: the phone races the two routes and presents the token on whichever
+/// completes the pinned handshake first, and on that one only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DualInvite {
+    /// Always [`INVITE_KIND`].
+    pub kind: String,
+    /// Always [`DUAL_INVITE_VERSION`].
+    pub version: u8,
+    /// Session protocol identifier. Unchanged by the route.
+    pub protocol: String,
+    /// The exact IP the host is bound to, as in v4.
+    pub addr: String,
+    /// The exact bound port.
+    pub port: u16,
+    /// The relay's address, as the host reached it, as in v5.
+    pub relay_addr: String,
+    /// The relay's port.
+    pub relay_port: u16,
+    /// The session id the relay issued to this host. Signed, as in v5.
+    pub session: String,
+    /// The one-use 256-bit token, hex. ONE token for both routes.
+    pub token: String,
+    /// Random per-invite nonce, hex.
+    pub nonce: String,
+    /// Unix seconds at which this invite stops being valid.
+    pub expires_at: u64,
+    /// What this invite grants. Signed, so it cannot be widened in transit.
+    pub capabilities: Vec<String>,
+    /// Host's Noise static X25519 public key, lowercase hex. **Pinned** — on
+    /// both routes, which is what keeps the relay route untrusted.
+    pub host_pubkey: String,
+    /// Host's durable Ed25519 identity public key, standard base64.
+    pub host_identity_pubkey: String,
+    /// Ed25519 signature over [`dual_canonical_bytes`], standard base64.
+    pub signature: String,
+}
+
+/// The exact bytes a v6 signature covers.
+///
+/// **Must match `InviteDecoder.canonicalBytesV6` in the Kotlin client byte for
+/// byte.** `contract/signed_invite_v6.json` catches divergence in CI.
+///
+/// Field order is load-bearing and is not alphabetical. The LAN route sits
+/// where v4 has it and the relay route follows it in v5's order, so each route
+/// is signed as a unit, exactly as it is on its own.
+pub fn dual_canonical_bytes(
+    kind: &str,
+    version: u8,
+    protocol: &str,
+    addr: &str,
+    port: u16,
+    relay_addr: &str,
+    relay_port: u16,
+    session: &str,
+    token: &str,
+    nonce: &str,
+    expires_at: u64,
+    capabilities: &[String],
+    host_pubkey: &str,
+) -> Vec<u8> {
+    format!(
+        "{kind}\n{version}\n{protocol}\n{addr}\n{port}\n{relay_addr}\n{relay_port}\n{session}\n{token}\n{nonce}\n{expires_at}\n{}\n{host_pubkey}",
+        capabilities.join(",")
+    )
+    .into_bytes()
+}
+
+impl DualInvite {
+    /// The bytes this invite's signature covers.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        dual_canonical_bytes(
+            &self.kind,
+            self.version,
+            &self.protocol,
+            &self.addr,
+            self.port,
+            &self.relay_addr,
+            self.relay_port,
+            &self.session,
+            &self.token,
+            &self.nonce,
+            self.expires_at,
+            &self.capabilities,
+            &self.host_pubkey,
+        )
+    }
+
+    /// Render as the compact JSON that goes into the QR.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).expect("DualInvite is always serialisable")
+    }
+
+    /// The first field that would break the canonical encoding, if any.
+    fn separator_in_field(&self) -> Option<&'static str> {
+        for (name, value) in [
+            ("kind", &self.kind),
+            ("protocol", &self.protocol),
+            ("addr", &self.addr),
+            ("relay_addr", &self.relay_addr),
+            ("session", &self.session),
+            ("token", &self.token),
+            ("nonce", &self.nonce),
+            ("host_pubkey", &self.host_pubkey),
+        ] {
+            if field_carries_separator(value) {
+                return Some(name);
+            }
+        }
+        self.capabilities
+            .iter()
+            .any(|c| field_carries_separator(c))
+            .then_some("capabilities")
+    }
+}
+
 impl SignedInvite {
     /// The bytes this invite's signature covers.
     pub fn canonical_bytes(&self) -> Vec<u8> {
@@ -324,7 +455,7 @@ pub enum DecodeError {
         /// What the `kind` field said, if anything.
         found: String,
     },
-    /// A version this build does not decode. v5, v4 and v3 are accepted;
+    /// A version this build does not decode. v6, v5, v4 and v3 are accepted;
     /// anything else is refused rather than guessed at.
     UnsupportedVersion {
         /// The version encountered.
@@ -362,7 +493,7 @@ impl DecodeError {
     }
 }
 
-/// Decode an invite from QR text, accepting v5 and v4, and — strictly — v3.
+/// Decode an invite from QR text, accepting v6, v5 and v4, and — strictly — v3.
 ///
 /// "Strictly" means a v3 invite is decoded into the v4 shape with its *own*
 /// canonical bytes preserved for verification, not silently re-signed or
@@ -412,6 +543,26 @@ pub fn decode(text: &str) -> Result<Decoded, DecodeError> {
                 return Err(DecodeError::SeparatorInField { field });
             }
             Ok(Decoded::V5(invite))
+        }
+        DUAL_INVITE_VERSION => {
+            let kind = obj
+                .get("kind")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string();
+            if kind != INVITE_KIND {
+                return Err(DecodeError::WrongKind { found: kind });
+            }
+            // Every route field is required by the type: a v6 missing either
+            // route is Malformed, never quietly read as the route it kept.
+            let invite: DualInvite =
+                serde_json::from_value(v.clone()).map_err(|e| DecodeError::Malformed {
+                    field: field_of(&e.to_string()),
+                })?;
+            if let Some(field) = invite.separator_in_field() {
+                return Err(DecodeError::SeparatorInField { field });
+            }
+            Ok(Decoded::V6(invite))
         }
         LEGACY_INVITE_VERSION => {
             // v3 has no `kind`. Requiring one would refuse every invite from the
@@ -491,6 +642,8 @@ fn field_of(msg: &str) -> &'static str {
 /// A decoded invite, tagged by the schema it arrived in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decoded {
+    /// A host reachable both on the LAN and through a relay.
+    V6(DualInvite),
     /// A host reached through a relay.
     V5(RelayInvite),
     /// A host bound to an interface.
@@ -833,13 +986,124 @@ mod v5_tests {
         );
     }
 
+    fn signed_v6() -> DualInvite {
+        let k = key();
+        let caps = vec!["view".to_string(), "control".to_string()];
+        let canonical = dual_canonical_bytes(
+            INVITE_KIND,
+            DUAL_INVITE_VERSION,
+            SESSION_PROTOCOL,
+            "192.168.1.20",
+            8082,
+            "203.0.113.9",
+            9443,
+            "AAAAAAAAAAAAAAAAAAAAAA",
+            &"1f".repeat(32),
+            &"9c".repeat(16),
+            1_787_000_060,
+            &caps,
+            &"ab".repeat(32),
+        );
+        DualInvite {
+            kind: INVITE_KIND.into(),
+            version: DUAL_INVITE_VERSION,
+            protocol: SESSION_PROTOCOL.into(),
+            addr: "192.168.1.20".into(),
+            port: 8082,
+            relay_addr: "203.0.113.9".into(),
+            relay_port: 9443,
+            session: "AAAAAAAAAAAAAAAAAAAAAA".into(),
+            token: "1f".repeat(32),
+            nonce: "9c".repeat(16),
+            expires_at: 1_787_000_060,
+            capabilities: caps,
+            host_pubkey: "ab".repeat(32),
+            host_identity_pubkey: STANDARD.encode(k.verifying_key().to_bytes()),
+            signature: STANDARD.encode(k.sign(&canonical).to_bytes()),
+        }
+    }
+
+    #[test]
+    fn a_v6_invite_decodes_as_v6_and_verifies() {
+        let six = signed_v6();
+        match decode(&six.to_json()) {
+            Ok(Decoded::V6(d)) => {
+                assert_eq!(d, six);
+                assert!(signature_is_valid(
+                    &d.canonical_bytes(),
+                    &d.host_identity_pubkey,
+                    &d.signature
+                ));
+            }
+            other => panic!("a v6 invite decoded as {other:?}"),
+        }
+    }
+
+    /// **A v6 that lost a route is refused, not read as the route it kept.**
+    /// Including a v5 relabelled as v6: it has no LAN route.
+    #[test]
+    fn a_v6_missing_either_route_is_malformed() {
+        for field in ["addr", "port", "relay_addr", "relay_port", "session"] {
+            let mut v: serde_json::Value = serde_json::from_str(&signed_v6().to_json()).unwrap();
+            v.as_object_mut().unwrap().remove(field);
+            match decode(&v.to_string()) {
+                Err(DecodeError::Malformed { field: f }) => {
+                    assert_eq!(f, field, "removing {field} was reported as {f}")
+                }
+                other => panic!("a v6 without {field} decoded as {other:?}"),
+            }
+        }
+        let mut five = signed_v5();
+        five.version = DUAL_INVITE_VERSION;
+        assert!(
+            matches!(decode(&five.to_json()), Err(DecodeError::Malformed { .. })),
+            "a v5 relabelled as v6 was accepted"
+        );
+    }
+
+    #[test]
+    fn a_v6_route_field_carrying_the_separator_is_refused() {
+        for (field, bad) in [
+            (
+                "addr",
+                DualInvite {
+                    addr: "192.168.1.20\n8082".into(),
+                    ..signed_v6()
+                },
+            ),
+            (
+                "relay_addr",
+                DualInvite {
+                    relay_addr: "203.0.113.9\n9443".into(),
+                    ..signed_v6()
+                },
+            ),
+            (
+                "session",
+                DualInvite {
+                    session: "AAAA\nBBBB".into(),
+                    ..signed_v6()
+                },
+            ),
+        ] {
+            assert_eq!(
+                decode(&bad.to_json()),
+                Err(DecodeError::SeparatorInField { field }),
+                "{field}"
+            );
+        }
+    }
+
     #[test]
     fn an_unknown_version_is_still_refused_by_name() {
+        // 7, not 6: v6 is the both-routes invite now, and a v5 relabelled as
+        // v6 is refused as Malformed (it has no LAN route), which is tested
+        // with the v6 decoder.
         let mut five = signed_v5();
-        five.version = 6;
+        five.version = 7;
         assert_eq!(
             decode(&five.to_json()),
-            Err(DecodeError::UnsupportedVersion { found: 6 })
+            Err(DecodeError::UnsupportedVersion { found: 7 })
         );
     }
 
@@ -851,5 +1115,23 @@ mod v5_tests {
             decode(&five.to_json()),
             Err(DecodeError::WrongKind { .. })
         ));
+    }
+
+    /// Red-proof gap closed 2026-09-17: nothing failed when the v6 arm stopped
+    /// checking `kind`. The signature would still refuse such a code later, but
+    /// the operator would be told "bad signature" about a QR that was never a
+    /// pairing invite at all.
+    #[test]
+    fn a_v6_qr_that_is_not_a_pairing_invite_is_named_as_such() {
+        let six = DualInvite {
+            kind: "something-else".into(),
+            ..signed_v6()
+        };
+        assert_eq!(
+            decode(&six.to_json()),
+            Err(DecodeError::WrongKind {
+                found: "something-else".into()
+            })
+        );
     }
 }

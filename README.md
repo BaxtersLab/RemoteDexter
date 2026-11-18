@@ -53,6 +53,12 @@ Every file ships with a `.sha256` checksum. The Android app is signed with a cer
 
 A Windows host builds from source; prebuilt Windows binaries are not yet provided.
 
+The 3.1.0.1 calibration hotfix needs both the updated phone app and host.
+Updated peers negotiate resolution-independent pointer coordinates; an updated
+host keeps native-size video for older clients. Updating only the phone does not
+repair the coordinate mismatch in an older adaptive-resolution host. Cursor lift
+is a separate preference and does not compensate for that mismatch.
+
 ## Quick start
 
 ### 1. Install the host
@@ -108,7 +114,6 @@ The host can connect *out* to a relay instead of listening, so it works from beh
 ## Known limitations
 
 - **Screen lock.** While the host is locked, input and clipboard are refused. A phone that already holds control keeps it for up to five seconds after the lock, because lock state is polled rather than subscribed to.
-- **Single instance.** Nothing yet prevents starting a second host on the same machine.
 - **Windows.** The host builds for Windows, but prebuilt Windows binaries are not yet published.
 
 [`ROADMAP.md`](ROADMAP.md) lists things RemoteDexter deliberately declines to do, so a refusal isn't mistaken for a bug.

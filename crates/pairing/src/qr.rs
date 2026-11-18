@@ -53,10 +53,23 @@ impl QrBitmap {
 ///
 /// The quiet zone is not decoration: without it many scanners simply fail, and
 /// the failure looks like a bad invite rather than a bad render.
+///
+/// The code is the SMALLER of two encodings: the library's mixed-mode one and a
+/// single byte-mode segment. The library's segment optimizer is not optimal —
+/// measured 2026-09-17, it put a 560-byte payload with short digit runs at 113
+/// modules where plain byte mode needs 97, and made 23-36% of real dual-route
+/// invites a version larger than their length requires. Taking the smaller
+/// means a code is never larger than byte mode for its length, which is a bound
+/// the density tests can pin; mixed mode still wins where it genuinely helps.
 pub fn encode(text: &str) -> Result<QrBitmap, String> {
     const QUIET: usize = 4;
-    let code = qrcode::QrCode::with_error_correction_level(text, qrcode::EcLevel::M)
+    const EC: qrcode::EcLevel = qrcode::EcLevel::M;
+    let mixed = qrcode::QrCode::with_error_correction_level(text, EC)
         .map_err(|e| format!("QR encode failed: {e}"))?;
+    let code = match byte_mode(text.as_bytes(), EC) {
+        Some(bytes) if bytes.width() < mixed.width() => bytes,
+        _ => mixed,
+    };
     let width = code.width();
     let colors = code.to_colors();
     let size = width + QUIET * 2;
@@ -68,6 +81,17 @@ pub fn encode(text: &str) -> Result<QrBitmap, String> {
         }
     }
     Ok(QrBitmap { size, modules })
+}
+
+/// `data` as ONE byte-mode segment at the smallest version that holds it, or
+/// `None` if no version does.
+fn byte_mode(data: &[u8], ec: qrcode::EcLevel) -> Option<qrcode::QrCode> {
+    (1..=40).find_map(|v| {
+        let mut bits = qrcode::bits::Bits::new(qrcode::Version::Normal(v));
+        bits.push_byte_data(data).ok()?;
+        bits.push_terminator(ec).ok()?;
+        qrcode::QrCode::with_bits(bits, ec).ok()
+    })
 }
 
 #[cfg(test)]
@@ -110,6 +134,22 @@ mod tests {
         assert_eq!(px[14 * side + 14], 0);
         // The quiet zone stays light.
         assert_eq!(px[0], 255);
+    }
+
+    /// Regression, 2026-09-17: the library's mixed-mode optimizer put this
+    /// 560-byte payload at 113 modules. One byte-mode segment holds it in 97.
+    #[test]
+    fn a_payload_the_optimizer_inflates_is_drawn_at_its_byte_mode_size() {
+        let text = &"ab1234".repeat(110)[..560];
+        assert_eq!(encode(text).unwrap().size, 97);
+    }
+
+    /// And where mixed mode genuinely wins (97 against byte mode's 101), the
+    /// smaller code is still the one drawn.
+    #[test]
+    fn mixed_mode_is_kept_where_it_is_the_smaller_code() {
+        let text = &"0123456789abcdef".repeat(40)[..600];
+        assert_eq!(encode(text).unwrap().size, 97);
     }
 
     #[test]

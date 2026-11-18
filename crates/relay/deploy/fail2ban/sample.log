@@ -1,0 +1,29 @@
+# relayd journal lines for the remotedexter-relay filter, as fail2ban's systemd backend formats them.
+# Addresses are from the RFC 5737 documentation ranges; the hostname is a placeholder.
+# EXPECTED with: fail2ban-regex sample.log filter.d/remotedexter-relay.conf
+#   matched: 6   (4 x "frame too large", 2 x "malformed frame")
+#   missed:  14  (one per must-not-ban line, plus two look-alikes that must not match)
+# crates/relay/tests/fail2ban_contract.rs checks these lines against the code's own strings.
+# --- positives: the only two triggers ---
+2026-09-14T09:00:01+00:00 relay-host relayd[4242]: [relayd] 192.0.2.10:2412: frame too large
+2026-09-14T09:00:02+00:00 relay-host relayd[4242]: [relayd] 192.0.2.10:2413: frame too large
+2026-09-14T09:00:03+00:00 relay-host relayd[4242]: [relayd] 192.0.2.10:2414: frame too large
+2026-09-14T09:00:04+00:00 relay-host relayd[4242]: [relayd] 192.0.2.10:1674: malformed frame
+2026-09-14T09:00:05+00:00 relay-host relayd[4242]: [relayd] 192.0.2.20:50611: frame too large
+2026-09-14T09:00:06+00:00 relay-host relayd[4242]: [relayd] 192.0.2.20:50612: malformed frame
+# --- negatives: must never ban ---
+2026-09-14T09:01:01+00:00 relay-host relayd[4242]: [relayd] 203.0.113.7:40001: not authorised
+2026-09-14T09:01:02+00:00 relay-host relayd[4242]: [relayd] 203.0.113.7:40002: unsupported protocol version
+2026-09-14T09:01:03+00:00 relay-host relayd[4242]: [relayd] 203.0.113.7:40003: unexpected frame
+2026-09-14T09:01:04+00:00 relay-host relayd[4242]: [relayd] 203.0.113.7:40004: relay at capacity
+2026-09-14T09:01:05+00:00 relay-host relayd[4242]: [relayd] 198.51.100.30:15658: connection closed
+2026-09-14T09:01:06+00:00 relay-host relayd[4242]: [relayd] 203.0.113.7:40006: session ended: one side took nothing for 30 s
+2026-09-14T09:01:07+00:00 relay-host relayd[4242]: [relayd] refused 203.0.113.7:40007: 256 connections already unauthenticated
+2026-09-14T09:01:08+00:00 relay-host relayd[4242]: [relayd] refused 41 more in the last 1000 ms: 256 connections already unauthenticated
+2026-09-14T09:01:09+00:00 relay-host relayd[4242]: [relayd] 203.0.113.7:40009: no frame within 10 s
+2026-09-14T09:01:10+00:00 relay-host relayd[4242]: [relayd] 203.0.113.7:40010: no such session
+2026-09-14T09:01:11+00:00 relay-host relayd[4242]: [relayd] 203.0.113.7:40011: empty frame
+2026-09-14T09:01:12+00:00 relay-host relayd[4242]: [relayd] capacity: 33 of 64 sessions live (51%)
+# --- look-alikes: the trigger words, but not a relayd refusal ---
+2026-09-14T09:02:01+00:00 relay-host sshd[999]: [relayd] 198.51.100.9:22: frame too large
+2026-09-14T09:02:02+00:00 relay-host relayd[4242]: [relayd] 198.51.100.9:7: frame too large (again)
