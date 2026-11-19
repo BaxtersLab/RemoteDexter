@@ -68,14 +68,32 @@ mod tests {
         );
         for rung in crate::stream_ladder::RUNGS {
             assert_eq!(coordinates.scale_pct(rung.scale_pct), 100);
-            assert_eq!(
-                InputCoordinates::NormalizedV1.scale_pct(rung.scale_pct),
-                rung.scale_pct
-            );
         }
         let mut message = absolute(1439, 809);
         coordinates.convert(&mut message, None).unwrap();
         assert_eq!(axes(message), (1439, 809));
+    }
+
+    /// RD-RES-1 (3.1.0.2). The updated phone app speaks normalized coordinates,
+    /// and that is what let 3.1.0's reduced-resolution rungs reach it: over the
+    /// relay the operator's picture sank to the 33% floor within seconds and
+    /// stayed there until a reconnect. Every phone now gets full-size frames at
+    /// every rung — what the phone had before it was updated.
+    #[test]
+    fn every_phone_gets_full_size_frames_at_every_rung() {
+        for rung in crate::stream_ladder::RUNGS {
+            for coordinates in [
+                InputCoordinates::DesktopPixels,
+                InputCoordinates::NormalizedV1,
+            ] {
+                assert_eq!(
+                    coordinates.scale_pct(rung.scale_pct),
+                    100,
+                    "{coordinates:?} at a {}% rung would be sent shrunk",
+                    rung.scale_pct
+                );
+            }
+        }
     }
 
     #[test]
@@ -190,10 +208,16 @@ impl InputCoordinates {
         ack.to_string()
     }
 
+    /// The size, in percent, to send a frame at for a client in this space.
+    ///
+    /// Older clients map touches in desktop pixels, so they always get native
+    /// size. Normalized clients could take a smaller frame, but the reduced
+    /// rungs are switched off (`stream_ladder::REDUCED_RESOLUTION`, RD-RES-1),
+    /// so today every client gets full size.
     pub(crate) fn scale_pct(self, requested: u16) -> u16 {
         match self {
-            Self::DesktopPixels => 100,
-            Self::NormalizedV1 => requested,
+            Self::NormalizedV1 if crate::stream_ladder::REDUCED_RESOLUTION => requested,
+            Self::DesktopPixels | Self::NormalizedV1 => 100,
         }
     }
 

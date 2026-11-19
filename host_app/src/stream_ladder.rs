@@ -121,6 +121,24 @@ pub const RUNGS: [Rung; 11] = [
     }, // ~0.4 Mbit/s — the floor
 ];
 
+/// Whether the lower rungs may shrink the picture (`scale_pct < 100`).
+///
+/// **Off since 3.1.0.2 (RD-RES-1).** 3.1.0 added rungs that send 75% down to
+/// 33% of the desktop's size on a slow link, and 3.1.0.1's calibration fix let
+/// them reach every phone that speaks normalized coordinates. Over the relay
+/// the operator's picture sank to the 33% floor within seconds and stayed
+/// there until a reconnect, for two reasons this ladder cannot yet answer:
+/// it climbs only after `PROMOTE_AFTER_CLEAN_WINDOWS` drop-free windows (about
+/// 16 s per rung at 3 fps), and a still desktop sends no frames at all, so the
+/// last fuzzy frame is the one left on the phone.
+///
+/// Until recovery is fixed — sharpen when the desktop goes still, climb on a
+/// drop *rate* rather than on perfection — every phone gets full-size frames:
+/// what the operator's phone had before it was updated, slower on a slow link
+/// but never shrunk. The scaled rungs keep their frame interval and quality,
+/// so the ladder still backs off; it just no longer throws away resolution.
+pub const REDUCED_RESOLUTION: bool = false;
+
 /// Decisions per evaluation window.
 pub const WINDOW_FRAMES: u32 = 16;
 

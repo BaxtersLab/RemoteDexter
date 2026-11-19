@@ -59,6 +59,9 @@ host keeps native-size video for older clients. Updating only the phone does not
 repair the coordinate mismatch in an older adaptive-resolution host. Cursor lift
 is a separate preference and does not compensate for that mismatch.
 
+3.1.0.2 sends every phone full-size frames: the reduced-resolution steps
+added in 3.1.0 are switched off until they recover properly on a slow link.
+
 ## Quick start
 
 ### 1. Install the host

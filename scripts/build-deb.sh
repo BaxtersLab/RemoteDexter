@@ -33,7 +33,7 @@
 # (input_grant::tests::*_where_the_package_installs_it), so a layout change that
 # forgets one of them fails in a second instead of on a user's machine.
 #
-# THE VERSION is the control file's, unchanged: 3.1.0.1-1. Until 3.0.13 it carried
+# THE VERSION is the control file's, unchanged: 3.1.0.2-1. Until 3.0.13 it carried
 # the commit (3.0.13+<sha>) so that two builds could never share a version. In
 # the Baxters train that job belongs to the version ledger, where every version
 # is used once, and to build-package.sh, which stamps the source commit INSIDE

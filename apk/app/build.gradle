@@ -108,8 +108,11 @@ android {
         //
         // `buildStamp()` appends the commit the artifact was built from, so
         // every build identifies itself whether or not anyone remembered.
-        versionCode 16
-        versionName "3.1.0.1+" + buildStamp()
+        // 3.1.0.2 (versionCode 17): every phone gets full-size frames again
+        // (RD-RES-1); the phone app itself is unchanged since 3.1.0.1, but the
+        // source export requires the APK and the .deb to name one version.
+        versionCode 17
+        versionName "3.1.0.2+" + buildStamp()
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
