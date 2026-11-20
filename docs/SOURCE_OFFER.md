@@ -41,6 +41,7 @@ the work:
 * `Cargo.lock` and the Gradle lockfiles, so the dependency set is reproducible
   rather than "whatever crates.io serves today";
 * the build scripts: `scripts/build_android_so.sh`, `scripts/build-deb.sh`,
+  `scripts/third_party_notices.py` (the `.deb`'s licence texts),
   `apk/gradlew` and the wrapper properties;
 * installation information for the `.deb` — the packaging directory.
 

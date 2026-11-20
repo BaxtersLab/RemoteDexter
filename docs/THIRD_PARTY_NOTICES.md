@@ -108,3 +108,14 @@ by signed QR with remembered device keys, and the relay is ciphertext-only.
 None vendored as of Block 1. Material icons arrive with
 `com.google.android.material` (Apache-2.0). Anything added later needs a row
 here before it is committed.
+
+## 5. Licence texts in the Linux package
+
+This file records obligations; it does not carry licence texts. Since
+3.1.0.2-2 the Linux package also ships
+`/opt/baxters/remotedexter/THIRD_PARTY_LICENSES`, beside `host_app`: every
+third-party crate the host links, each with its licence's full text,
+generated from `Cargo.lock` by `scripts/third_party_notices.py` when the
+package is built. 3.1.0.2-1 shipped
+without it. `scripts/check_deb_notices.sh` (gate row `deb-notices`) fails a
+package that lacks it.

@@ -17,7 +17,8 @@
 #       host_app                        the host
 #       remotedexter-enable-input       the one privileged operation, via pkexec
 #       70-remotedexter-uinput.rules    inert data; copied out only by "Enable input"
-#   /usr/bin/remotedexter               a symlink to run.sh, so the documented
+#       THIRD_PARTY_LICENSES            the licence texts of every crate host_app links
+#   /usr/bin/remotedexter              a symlink to run.sh, so the documented
 #                                       `RD_CAP_INPUT=1 remotedexter` still works
 #   /usr/share/applications/baxters-remotedexter.desktop
 #   /usr/share/icons/hicolor/*/apps/baxters-remotedexter.png
@@ -33,7 +34,7 @@
 # (input_grant::tests::*_where_the_package_installs_it), so a layout change that
 # forgets one of them fails in a second instead of on a user's machine.
 #
-# THE VERSION is the control file's, unchanged: 3.1.0.2-1. Until 3.0.13 it carried
+# THE VERSION is the control file's, unchanged: 3.1.0.2-2. Until 3.0.13 it carried
 # the commit (3.0.13+<sha>) so that two builds could never share a version. In
 # the Baxters train that job belongs to the version ledger, where every version
 # is used once, and to build-package.sh, which stamps the source commit INSIDE
@@ -88,6 +89,24 @@ install -d -m 0755 \
     "$PKGDIR/usr/share/doc/baxters-remotedexter"
 
 install -m 0755 target/release/host_app                       "$PKGDIR/opt/baxters/remotedexter/host_app"
+# host_app statically links third-party Rust crates and the Rust standard library,
+# and MIT, BSD, ISC, Zlib and Apache-2.0 require their notices to travel with
+# every binary copy. 3.1.0.2-1 shipped none, and the Baxters train's select step
+# refused it (r13, 2026-11-19). The texts are generated from Cargo.lock at build
+# time, so the list is what links, never a hand-kept guess; `cargo metadata`
+# runs --offline, so the build still needs no network. docs/THIRD_PARTY_NOTICES.md
+# stays the record of obligations and ships too; it carries no licence texts.
+#
+# scripts/third_party_notices.py is a byte-identical copy of the Baxters
+# packaging generator (baxters-repo packaging/third_party_notices.py, bee4dd2),
+# kept in this tree so that this published script builds the package as
+# released from this repository alone. scripts/check_deb_notices.sh holds the
+# package to it. A failed or empty generation refuses the build.
+python3 -I scripts/third_party_notices.py --manifest-path "$ROOT/Cargo.toml" --title RemoteDexter \
+    --package host_app > "$PKGDIR/opt/baxters/remotedexter/THIRD_PARTY_LICENSES.tmp"
+mv "$PKGDIR/opt/baxters/remotedexter/THIRD_PARTY_LICENSES.tmp" "$PKGDIR/opt/baxters/remotedexter/THIRD_PARTY_LICENSES"
+[ -s "$PKGDIR/opt/baxters/remotedexter/THIRD_PARTY_LICENSES" ] \
+    || { echo "REFUSING TO BUILD: the third-party notices came out empty" >&2; exit 1; }
 install -m 0755 packaging/linux/remotedexter-launcher          "$PKGDIR/opt/baxters/remotedexter/run.sh"
 install -m 0755 packaging/linux/remotedexter-enable-input      "$PKGDIR/opt/baxters/remotedexter/remotedexter-enable-input"
 # Inert data. NOT installed into /etc/udev/rules.d or /usr/lib/udev/rules.d by

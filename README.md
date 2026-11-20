@@ -138,7 +138,7 @@ cargo build --release -p host_app
 ./scripts/build-deb.sh
 ```
 
-No root and no network. The build refuses to produce a package if anything credential-shaped has been staged into it.
+No root and no network. The build refuses to produce a package if anything credential-shaped has been staged into it. It also writes the licence text of every crate the host links into the package, with `scripts/third_party_notices.py`, which needs `python3` 3.11 or later.
 
 **Android client** — a standard Gradle project in `apk/`. The native library is built by `scripts/build_android_so.sh`. Release signing reads credentials from your environment and never from the tree; since an unsigned release build still succeeds, verify the result with `apksigner verify` rather than trusting the build's exit status.
 
